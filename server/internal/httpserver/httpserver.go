@@ -18,6 +18,9 @@ import (
 type Options struct {
 	// Static is the frontend dist filesystem (SPA root). Optional during M0.
 	Static fs.FS
+	// TRPC is the tRPC v11 API handler mounted at /api/trpc/*. Nil skips the
+	// mount (placeholder builds without the API).
+	TRPC http.Handler
 	// Version is reported by the health endpoints.
 	Version string
 	// Started is the process start time, reported as uptime.
@@ -40,9 +43,12 @@ func New(opts Options) http.Handler {
 	r.Get("/api/health/live", healthHandler(opts, started, "live"))
 	r.Get("/api/health/ready", healthHandler(opts, started, "ready"))
 
-	// M1 mount point (planned):
-	//   r.Handle("/api/trpc/*", trpc.New(...))
-	//   r.Handle("/api/ws",     ws.NewHub(...))
+	if opts.TRPC != nil {
+		r.Handle("/api/trpc/*", opts.TRPC)
+	}
+
+	// M3 mount point (planned):
+	//   r.Handle("/api/ws", ws.NewHub(...))
 
 	if opts.Static != nil {
 		r.Handle("/*", spaHandler(opts.Static))

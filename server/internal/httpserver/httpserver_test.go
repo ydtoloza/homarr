@@ -9,6 +9,7 @@ import (
 	"testing/fstest"
 	"time"
 
+	"github.com/ydtoloza/homarr/server/internal/api/trpc"
 	"github.com/ydtoloza/homarr/server/internal/httpserver"
 )
 
@@ -79,5 +80,27 @@ func TestLandingWithoutStatic(t *testing.T) {
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusServiceUnavailable {
 		t.Errorf("got status %d, want 503 (no frontend embedded)", res.StatusCode)
+	}
+}
+
+func TestTRPCMountAnswersProtocolErrors(t *testing.T) {
+	h := httpserver.New(httpserver.Options{
+		TRPC:    trpc.New().Handler(), // no procedures registered yet (M2)
+		Started: time.Now(),
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	res, err := http.Get(srv.URL + "/api/trpc/board.getAll")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, _ := io.ReadAll(res.Body)
+	if res.StatusCode != http.StatusNotFound {
+		t.Errorf("got status %d, want 404 (tRPC NOT_FOUND)", res.StatusCode)
+	}
+	if !strings.Contains(string(body), `"code":"NOT_FOUND"`) {
+		t.Errorf("body %q does not carry the tRPC NOT_FOUND envelope", body)
 	}
 }

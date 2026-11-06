@@ -20,6 +20,7 @@ import (
 	"time"
 
 	homarr "github.com/ydtoloza/homarr/server"
+	"github.com/ydtoloza/homarr/server/internal/api/trpc"
 	"github.com/ydtoloza/homarr/server/internal/config"
 	"github.com/ydtoloza/homarr/server/internal/httpserver"
 )
@@ -52,9 +53,16 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	api := trpc.New()
+	// M2 registers the ported routers here (board, user, auth, ...). Until
+	// then every call answers the correct tRPC NOT_FOUND envelope on the wire.
 	srv := &http.Server{
-		Addr:              ":" + cfg.Port,
-		Handler:           httpserver.New(httpserver.Options{Static: homarr.Sub(), Version: version}),
+		Addr: ":" + cfg.Port,
+		Handler: httpserver.New(httpserver.Options{
+			Static:  homarr.Sub(),
+			TRPC:    api.Handler(),
+			Version: version,
+		}),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
