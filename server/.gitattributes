@@ -1,0 +1,4 @@
+# Keep shell scripts and Makefile LF so they work on Linux/CI
+# regardless of the development OS (Windows checkouts included).
+*.sh text eol=lf
+Makefile text eol=lf

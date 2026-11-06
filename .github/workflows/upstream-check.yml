@@ -1,0 +1,43 @@
+name: upstream-check
+
+# Nightly: report upstream commits pending to be ported to the Go backend.
+# Backend commits → manual port (see docs/PORTING.md). Frontend commits → git merge.
+on:
+  schedule:
+    - cron: "0 4 * * *" # 04:00 UTC daily
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/homarr-labs/homarr.git
+          git fetch upstream dev --tags
+      - name: Report pending commits
+        id: report
+        run: |
+          ./server/scripts/check-upstream.sh | tee report.txt
+          LINE=$(grep '^##SUMMARY' report.txt || echo "##SUMMARY backend=0")
+          echo "backend=$(echo "$LINE" | sed -E 's/.*backend=([0-9]+).*/\1/')" >> "$GITHUB_OUTPUT"
+      - name: Create or update porting issue
+        if: steps.report.outputs.backend != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DATE=$(date -u +%F)
+          BODY=$(cat report.txt)
+          N=$(gh issue list --state open --search "upstream-port in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$N" ]; then
+            gh issue comment "$N" --body "$BODY"
+          else
+            gh issue create --title "⬆️ upstream-port: commits backend pendientes ($DATE)" --body "$BODY"
+          fi
