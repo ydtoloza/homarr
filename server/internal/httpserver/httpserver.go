@@ -21,6 +21,9 @@ type Options struct {
 	// TRPC is the tRPC v11 API handler mounted at /api/trpc/*. Nil skips the
 	// mount (placeholder builds without the API).
 	TRPC http.Handler
+	// Auth is the Auth.js-compatible REST surface mounted at /api/auth/*
+	// (csrf, callback/credentials, session, signout). Nil skips the mount.
+	Auth http.Handler
 	// Version is reported by the health endpoints.
 	Version string
 	// Started is the process start time, reported as uptime.
@@ -45,6 +48,9 @@ func New(opts Options) http.Handler {
 
 	if opts.TRPC != nil {
 		r.Handle("/api/trpc/*", opts.TRPC)
+	}
+	if opts.Auth != nil {
+		r.Handle("/api/auth/*", opts.Auth)
 	}
 
 	// M3 mount point (planned):

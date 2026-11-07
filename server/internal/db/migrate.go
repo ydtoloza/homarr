@@ -181,6 +181,16 @@ func (d *DB) MigrateContext(ctx context.Context) error {
 	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
 		return fmt.Errorf("db: commit migrations: %w", err)
 	}
+
+	// Parity: upstream applies migrations in a separate process, so runtime
+	// connections never see foreign_keys=ON. Some migration files enable it
+	// explicitly and it persists per-connection; this connection comes from
+	// the same pool, so restore better-sqlite3's runtime default (OFF)
+	// before handing it back. Upstream therefore tolerates non-cascading
+	// deletes that would otherwise fail here (see db package doc).
+	if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys=OFF"); err != nil {
+		return fmt.Errorf("db: restore foreign_keys pragma after migrations: %w", err)
+	}
 	return nil
 }
 

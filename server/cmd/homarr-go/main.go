@@ -1,13 +1,16 @@
 // Command homarr-go is the single Go binary that replaces the Homarr
 // runtime stack (nginx + redis + next.js + websocket/tasks apps).
 //
-// Phase M0: HTTP server with health endpoints and embedded static frontend.
-// Later phases mount the tRPC-compatible API, the WebSocket hub and the
-// job scheduler under the same process.
+// M2: SQLite database (drizzle-compatible migrations), Auth.js-compatible
+// credentials login at /api/auth/*, and the ported tRPC routers (board,
+// section, app, userItemState, user, group, invite, onboard, serverSettings,
+// searchEngine, apiKeys, info) mounted behind the session middleware.
 package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -16,12 +19,25 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"strings"
 	"syscall"
 	"time"
 
 	homarr "github.com/ydtoloza/homarr/server"
+	"github.com/ydtoloza/homarr/server/internal/api/router/apikeys"
+	"github.com/ydtoloza/homarr/server/internal/api/router/bangs"
+	"github.com/ydtoloza/homarr/server/internal/api/router/board"
+	"github.com/ydtoloza/homarr/server/internal/api/router/group"
+	"github.com/ydtoloza/homarr/server/internal/api/router/info"
+	"github.com/ydtoloza/homarr/server/internal/api/router/invite"
+	"github.com/ydtoloza/homarr/server/internal/api/router/onboard"
+	"github.com/ydtoloza/homarr/server/internal/api/router/searchengine"
+	"github.com/ydtoloza/homarr/server/internal/api/router/serversettings"
+	"github.com/ydtoloza/homarr/server/internal/api/router/user"
 	"github.com/ydtoloza/homarr/server/internal/api/trpc"
+	"github.com/ydtoloza/homarr/server/internal/auth"
 	"github.com/ydtoloza/homarr/server/internal/config"
+	"github.com/ydtoloza/homarr/server/internal/db"
 	"github.com/ydtoloza/homarr/server/internal/httpserver"
 )
 
@@ -53,14 +69,29 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	database, err := db.Open(cfg.DBPath())
+	if err != nil {
+		return err
+	}
+	defer database.Close()
+	// Apply the embedded drizzle migrations (idempotent; upstream runs them
+	// at container start via node ./db/migrations/sqlite/migrate.cjs).
+	if err := database.Migrate(); err != nil {
+		return fmt.Errorf("apply database migrations: %w", err)
+	}
+	slog.Info("database ready", "path", cfg.DBPath(), "migrations", mustMigrationCount(database))
+
+	authSvc := auth.New(database, auth.Options{Secret: secretForCSRF()})
 	api := trpc.New()
-	// M2 registers the ported routers here (board, user, auth, ...). Until
-	// then every call answers the correct tRPC NOT_FOUND envelope on the wire.
+	registerRouters(api, database)
+	slog.Info("tRPC routers registered")
+
 	srv := &http.Server{
 		Addr: ":" + cfg.Port,
 		Handler: httpserver.New(httpserver.Options{
 			Static:  homarr.Sub(),
-			TRPC:    api.Handler(),
+			TRPC:    authSvc.Middleware()(withRequestMeta(api.Handler())),
+			Auth:    authSvc.Handler(),
 			Version: version,
 		}),
 		ReadHeaderTimeout: 10 * time.Second,
@@ -86,6 +117,87 @@ func run() error {
 		}
 	}
 	return nil
+}
+
+// registerRouters mounts every ported tRPC router under its exact upstream
+// paths. Deferred procedures and routers are listed in the per-domain docs
+// (BOARDS.md, ADMIN.md, AUTH.md).
+func registerRouters(api *trpc.Router, database *db.DB) {
+	board.Register(api, database, board.Options{
+		DeviceTypeFromContext: deviceTypeFromContext,
+	})
+	user.Register(api, database, user.Options{
+		OnboardingClaimTokenFromContext: onboardingClaimFromContext,
+	})
+	group.Register(api, database, group.Options{})
+	invite.Register(api, database, invite.Options{})
+	onboard.Register(api, database, onboard.Options{
+		OnboardingClaimTokenFromContext: onboardingClaimFromContext,
+	})
+	serversettings.Register(api, database, serversettings.Options{})
+	searchengine.Register(api, database, searchengine.Options{})
+	bangs.Register(api, database, bangs.Options{}) // deferred upstream (duckduckgo proxy), M3
+	apikeys.Register(api, database, apikeys.Options{})
+	info.Register(api, database, info.Options{Version: version})
+}
+
+// Request-scoped context values consumed by router hooks, mirroring the
+// upstream tRPC context creation (packages/api/src/trpc.ts:53-71): the
+// caller device type comes from the User-Agent and the onboarding claim
+// token from its cookie.
+type deviceKeyType struct{}
+type onboardingClaimKeyType struct{}
+
+// withRequestMeta injects the device type and onboarding claim cookie into
+// the request context.
+func withRequestMeta(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		ctx = context.WithValue(ctx, deviceKeyType{}, deviceTypeFromUserAgent(r.UserAgent()))
+		if c, err := r.Cookie(onboard.OnboardingClaimCookieName); err == nil && c.Value != "" {
+			ctx = context.WithValue(ctx, onboardingClaimKeyType{}, c.Value)
+		}
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// deviceTypeFromUserAgent classifies the caller the way the frontend does:
+// only phones get the mobile home board (packages/api/src/trpc.ts:65).
+func deviceTypeFromUserAgent(ua string) string {
+	u := strings.ToLower(ua)
+	if strings.Contains(u, "mobile") && !strings.Contains(u, "ipad") && !strings.Contains(u, "tablet") {
+		return "mobile"
+	}
+	return "desktop"
+}
+
+func deviceTypeFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(deviceKeyType{}).(string)
+	return v
+}
+
+func onboardingClaimFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(onboardingClaimKeyType{}).(string)
+	return v
+}
+
+// secretForCSRF returns a fresh random secret per process start, matching
+// the upstream lifecycle (AUTH_SECRET is regenerated in scripts/run.sh:65);
+// the CSRF cookie only needs stability within one process lifetime.
+func secretForCSRF() string {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		panic("homarr-go: crypto/rand unavailable: " + err.Error())
+	}
+	return hex.EncodeToString(b)
+}
+
+func mustMigrationCount(database *db.DB) int {
+	n, err := database.MigrationCount()
+	if err != nil {
+		return -1
+	}
+	return n
 }
 
 func setupLogging() {
