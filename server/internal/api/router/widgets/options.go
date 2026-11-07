@@ -18,19 +18,32 @@ import (
 	"github.com/ydtoloza/homarr/server/internal/integrations/mediaorganizer/bindery"
 	"github.com/ydtoloza/homarr/server/internal/integrations/mediaorganizer/radarr"
 	"github.com/ydtoloza/homarr/server/internal/integrations/mediaorganizer/sonarr"
+	"github.com/ydtoloza/homarr/server/internal/integrations/mediaserver"
+	"github.com/ydtoloza/homarr/server/internal/integrations/mediaserver/emby"
+	"github.com/ydtoloza/homarr/server/internal/integrations/mediaserver/jellyfin"
+	"github.com/ydtoloza/homarr/server/internal/integrations/mediaserver/plex"
+	"github.com/ydtoloza/homarr/server/internal/integrations/network"
+	"github.com/ydtoloza/homarr/server/internal/integrations/network/adguardhome"
+	"github.com/ydtoloza/homarr/server/internal/integrations/network/pihole"
 )
 
 // Supported widget kinds (packages/definitions/src/widget-integration-map.ts):
 //
-//	mediaMissing: { supportedIntegrations: getIntegrationKindsByCategory("mediaOrganizer") } (:148)
-//	downloads:    { supportedIntegrations: getIntegrationKindsByCategory("downloadClient") } (:141)
+//	mediaMissing:      { supportedIntegrations: getIntegrationKindsByCategory("mediaOrganizer") } (:148)
+//	downloads:         { supportedIntegrations: getIntegrationKindsByCategory("downloadClient") } (:141)
+//	mediaServer:       { supportedIntegrations: getIntegrationKindsByCategory("mediaService") } (:138)
+//	dnsHoleSummary:    { supportedIntegrations: getIntegrationKindsByCategory("dnsHole") } (:128)
+//	dnsHoleControls:   { supportedIntegrations: getIntegrationKindsByCategory("dnsHole") } (:129)
 //
 // The lists are the integrationDef entries carrying the category, in
 // definition order (packages/definitions/src/integration.ts), with the demo
 // "mock" kind last (its definition is the last entry of integrationDefs).
 const (
-	WidgetKindMediaMissing = "mediaMissing"
-	WidgetKindDownloads    = "downloads"
+	WidgetKindMediaMissing    = "mediaMissing"
+	WidgetKindDownloads       = "downloads"
+	WidgetKindMediaServer     = "mediaServer"
+	WidgetKindDNSHoleSummary  = "dnsHoleSummary"
+	WidgetKindDNSHoleControls = "dnsHoleControls"
 )
 
 // SupportedKinds returns the integration kinds a widget kind accepts.
@@ -40,6 +53,10 @@ func SupportedKinds(widgetKind string) []string {
 		return []string{"sonarr", "sportarr", "radarr", "bindery", "mock"}
 	case WidgetKindDownloads:
 		return []string{"sabNzbd", "nzbGet", "deluge", "transmission", "qBittorrent", "aria2", "slskd", "mock"}
+	case WidgetKindMediaServer:
+		return []string{"jellyfin", "emby", "plex", "navidrome", "mock"}
+	case WidgetKindDNSHoleSummary, WidgetKindDNSHoleControls:
+		return []string{"piHole", "adGuardHome", "technitiumDns", "mock"}
 	default:
 		return nil
 	}
@@ -62,12 +79,24 @@ type Integration struct {
 
 // ResolveRequest is the upstream middleware contract: action "query" or
 // "interact" (IntegrationAction, middlewares/integration.ts:27), the widget
-// kind deciding the supported kinds, and the requested ids.
+// kind deciding the supported kinds, and the requested ids. Cardinality
+// mirrors IntegrationAccessMetadata.cardinality (middlewares/integration.ts:
+// 34): the ONE-integration middleware (dnsHole enable/disable) throws a
+// different NOT_FOUND message upstream than the many variant.
 type ResolveRequest struct {
 	Action         string
 	WidgetKind     string
 	IntegrationIDs []string
+	// Cardinality is CardinalityOne for the one-integration middleware and
+	// CardinalityMany (or empty, the historical default) for the many variant.
+	Cardinality string
 }
+
+// Cardinalities of ResolveRequest (middlewares/integration.ts:33-37).
+const (
+	CardinalityOne  = "one"
+	CardinalityMany = "many"
+)
 
 // ResolveIntegrations is the upstream createManyWidgetIntegrationMiddleware:
 // load the rows by id restricted to the widget's supported kinds, enforce the
@@ -86,6 +115,15 @@ type (
 	// IDownloadClientIntegration kinds (qBittorrent, transmission, deluge,
 	// sabNzbd, ...).
 	DownloadClientFactory func(integration Integration) (downloadclient.Client, error)
+	// MediaServerFactory mirrors createIntegrationAsync for
+	// IMediaServerIntegration kinds (plex, jellyfin, emby; navidrome pending).
+	MediaServerFactory func(integration Integration) (mediaserver.Client, error)
+	// NetworkFactory mirrors createIntegrationAsync for
+	// DnsHoleSummaryIntegration kinds (piHole — v5/v6 behind the version
+	// probe — and adGuardHome; technitiumDns pending). It receives the
+	// request context because the pi-hole construction probes the server
+	// version (createPiHoleIntegrationAsync is async upstream).
+	NetworkFactory func(ctx context.Context, integration Integration) (network.Client, error)
 )
 
 // SecretDecryptor decrypts one integrationSecret.value
@@ -98,9 +136,13 @@ type options struct {
 	secretDecryptor     SecretDecryptor
 	newMediaOrganizer   MediaOrganizerFactory
 	newDownloadClient   DownloadClientFactory
+	newMediaServer      MediaServerFactory
+	newNetwork          NetworkFactory
 	parallelism         int
 	mediaOrganizerTTL   int64 // ms; negative = cache disabled
 	downloadsTTL        int64 // ms; negative = cache disabled
+	mediaServerTTL      int64 // ms; negative = cache disabled
+	dnsHoleTTL          int64 // ms; negative = cache disabled
 }
 
 // DefaultParallelism bounds the per-request fan-out over integrations.
@@ -134,6 +176,12 @@ type Options struct {
 	// NewDownloadClient builds the download-client client (default dispatch:
 	// qBittorrent/transmission/deluge/sabNzbd).
 	NewDownloadClient DownloadClientFactory
+	// NewMediaServer builds the media-server client (default dispatch:
+	// plex/jellyfin/emby).
+	NewMediaServer MediaServerFactory
+	// NewNetwork builds the dns-hole client (default dispatch: piHole with
+	// the v5/v6 probe, adGuardHome).
+	NewNetwork NetworkFactory
 	// Parallelism bounds the integrations processed concurrently per request
 	// (0 -> DefaultParallelism).
 	Parallelism int
@@ -145,6 +193,14 @@ type Options struct {
 	// handler (packages/request-handler/src/downloads.ts:18); negative
 	// disables the cache. Test seam.
 	DownloadsCacheTTLMS int64
+	// MediaServerCacheTTLMS overrides the 10_000ms TTL of the media-server
+	// request handler (DEFAULT_TTL_MS, request-handler.ts:34); negative
+	// disables the cache. Test seam.
+	MediaServerCacheTTLMS int64
+	// DNSHoleCacheTTLMS overrides the 10_000ms TTL of the dns-hole request
+	// handler (DEFAULT_TTL_MS, request-handler.ts:34); negative disables the
+	// cache. Test seam.
+	DNSHoleCacheTTLMS int64
 }
 
 func (o Options) withDefaults() options {
@@ -153,9 +209,13 @@ func (o Options) withDefaults() options {
 		secretDecryptor:     o.SecretDecryptor,
 		newMediaOrganizer:   o.NewMediaOrganizer,
 		newDownloadClient:   o.NewDownloadClient,
+		newMediaServer:      o.NewMediaServer,
+		newNetwork:          o.NewNetwork,
 		parallelism:         o.Parallelism,
 		mediaOrganizerTTL:   o.MediaOrganizerCacheTTLMS,
 		downloadsTTL:        o.DownloadsCacheTTLMS,
+		mediaServerTTL:      o.MediaServerCacheTTLMS,
+		dnsHoleTTL:          o.DNSHoleCacheTTLMS,
 	}
 	if resolved.parallelism <= 0 {
 		resolved.parallelism = DefaultParallelism
@@ -168,6 +228,12 @@ func (o Options) withDefaults() options {
 	}
 	if resolved.newDownloadClient == nil {
 		resolved.newDownloadClient = DefaultDownloadClientFactory
+	}
+	if resolved.newMediaServer == nil {
+		resolved.newMediaServer = DefaultMediaServerFactory
+	}
+	if resolved.newNetwork == nil {
+		resolved.newNetwork = DefaultNetworkFactory
 	}
 	return resolved
 }
@@ -222,12 +288,60 @@ func DefaultDownloadClientFactory(integration Integration) (downloadclient.Clien
 	}
 }
 
+// DefaultMediaServerFactory dispatches on the integration kind. Unknown kinds
+// (navidrome — which carries the mediaService category and implements
+// IMediaServerIntegration upstream but is not ported yet, mock) fail per
+// integration like upstream's runtime failure.
+func DefaultMediaServerFactory(integration Integration) (mediaserver.Client, error) {
+	ref := mediaserver.IntegrationRef{
+		ID:          integration.ID,
+		Name:        integration.Name,
+		Kind:        integration.Kind,
+		URL:         integration.URL,
+		ExternalURL: integration.ExternalURL,
+		Secrets:     integration.SecretValues,
+	}
+	switch integration.Kind {
+	case "plex":
+		return plex.NewFromRef(ref)
+	case "jellyfin":
+		return jellyfin.NewFromRef(ref)
+	case "emby":
+		return emby.NewFromRef(ref)
+	default:
+		return nil, fmt.Errorf("media-server: kind %q does not implement the media-server interface", integration.Kind)
+	}
+}
+
+// DefaultNetworkFactory dispatches on the integration kind. The pi-hole
+// construction probes the server version (v5/v6) with the request context.
+func DefaultNetworkFactory(ctx context.Context, integration Integration) (network.Client, error) {
+	ref := network.IntegrationRef{
+		ID:          integration.ID,
+		Name:        integration.Name,
+		Kind:        integration.Kind,
+		URL:         integration.URL,
+		ExternalURL: integration.ExternalURL,
+		Secrets:     integration.SecretValues,
+	}
+	switch integration.Kind {
+	case "piHole":
+		return pihole.NewFromRef(ctx, ref)
+	case "adGuardHome":
+		return adguardhome.NewFromRef(ref)
+	default:
+		return nil, fmt.Errorf("dns-hole: kind %q does not implement the dns-hole interface", integration.Kind)
+	}
+}
+
 // service carries the configured dependencies of both routers.
 type service struct {
 	opts options
 
 	mediaOrganizerCache *resultCache
 	downloadsCache      *resultCache
+	mediaServerCache    *resultCache
+	dnsHoleCache        *resultCache
 }
 
 func newService(opts Options) *service {
@@ -238,6 +352,12 @@ func newService(opts Options) *service {
 	}
 	if o.downloadsTTL >= 0 {
 		s.downloadsCache = newResultCache(o.downloadsTTL)
+	}
+	if o.mediaServerTTL >= 0 {
+		s.mediaServerCache = newResultCache(o.mediaServerTTL)
+	}
+	if o.dnsHoleTTL >= 0 {
+		s.dnsHoleCache = newResultCache(o.dnsHoleTTL)
 	}
 	return s
 }
@@ -258,7 +378,11 @@ func (s *service) protected(next trpc.Procedure) trpc.Procedure {
 // decryptedSecrets: secrets.map(... value: decryptSecret(secret.value))).
 func (s *service) resolve(ctx context.Context, req ResolveRequest) ([]Integration, *trpc.Error) {
 	if s.opts.resolveIntegrations == nil {
-		return nil, trpc.NewError(trpc.CodeNotFound, notFoundMessage(len(req.IntegrationIDs), req.IntegrationIDs, SupportedKinds(req.WidgetKind), nil))
+		kinds := SupportedKinds(req.WidgetKind)
+		if req.Cardinality == CardinalityOne && len(req.IntegrationIDs) == 1 {
+			return nil, trpc.NewError(trpc.CodeNotFound, oneNotFoundMessage(req.IntegrationIDs[0], kinds))
+		}
+		return nil, trpc.NewError(trpc.CodeNotFound, notFoundMessage(len(req.IntegrationIDs), req.IntegrationIDs, kinds, nil))
 	}
 	rows, err := s.opts.resolveIntegrations(ctx, req)
 	if err != nil {
@@ -288,6 +412,14 @@ func (s *service) resolve(ctx context.Context, req ResolveRequest) ([]Integratio
 func notFoundMessage(offset int, requested, kinds []string, resolved []Integration) string {
 	return fmt.Sprintf("%d of the specified integrations not found or not of kinds %s: ([%s] compared to [%s])",
 		offset, joinStrings(kinds), joinStrings(requested), joinKindIDs(resolved))
+}
+
+// oneNotFoundMessage is the exact upstream TRPCError message of the ONE
+// integration middleware (middlewares/integration.ts:113-117):
+//
+//	"Integration with id <id> not found or not of kinds <kinds>"
+func oneNotFoundMessage(id string, kinds []string) string {
+	return fmt.Sprintf("Integration with id %s not found or not of kinds %s", id, joinStrings(kinds))
 }
 
 func joinStrings(list []string) string {

@@ -56,13 +56,63 @@ func UnwrapInput(raw json.RawMessage) (json.RawMessage, error) {
 // WrapJSON marshals v as a superjson payload ({"json": v}). v must be
 // JSON-serializable. A nil v mirrors superjson serializing `undefined`, which
 // JSON.stringify collapses to an empty object.
+//
+// A SuperJSON value passes through verbatim: it already carries its own
+// json/meta envelope (see SuperJSON).
 func WrapJSON(v any) (json.RawMessage, error) {
 	if v == nil {
 		return json.RawMessage("{}"), nil
 	}
+	if sj, ok := v.(SuperJSON); ok {
+		return json.RawMessage(sj), nil
+	}
 	return marshalJSON(struct {
 		JSON any `json:"json"`
 	}{JSON: v})
+}
+
+// SuperJSON is a fully transformed payload. Procedures, subscription Initial
+// values and subscription Decode results that need superjson TYPE annotations
+// (meta.values — e.g. Date fields the SPA must observe as real Date objects)
+// return this raw envelope instead of a plain value: the default
+// {"json": <output>} wrapping is skipped and the message reaches the wire
+// verbatim inside result.data, both on the HTTP side (writePlain, SSE data
+// events) and the WebSocket side (ws/conn.go wraps through WrapJSON).
+//
+// The message must be exactly what superjson's serialize would emit:
+// {"json": <value>, "meta": {"values": {...}, "v": 1}} (superjson src/index.ts
+// serialize: meta carries the walker annotations and is stamped v = 1).
+type SuperJSON json.RawMessage
+
+// WrapJSONWithMeta builds the full superjson envelope for a payload whose
+// client-side reconstruction needs type annotations: values maps DOTTED
+// payload paths (the superjson walker format — object members joined with ".",
+// array elements by index) to type names, e.g. {"timestamp": "Date"} for a
+// top-level Date or {"messages.0.timestamp": "Date"} inside a list. The
+// result feeds procedures as a SuperJSON return value.
+func WrapJSONWithMeta(v any, values map[string]string) (SuperJSON, error) {
+	payload, err := marshalJSON(v)
+	if err != nil {
+		return nil, err
+	}
+	metaValues := make(map[string]string, len(values))
+	for path, typeName := range values {
+		metaValues[path] = typeName
+	}
+	meta, err := marshalJSON(struct {
+		Values map[string]string `json:"values"`
+		V      int               `json:"v"`
+	}{Values: metaValues, V: 1})
+	if err != nil {
+		return nil, err
+	}
+	var buf bytes.Buffer
+	buf.WriteString(`{"json":`)
+	buf.Write(payload)
+	buf.WriteString(`,"meta":`)
+	buf.Write(meta)
+	buf.WriteString(`}`)
+	return SuperJSON(buf.Bytes()), nil
 }
 
 // marshalJSON encodes v without HTML escaping, matching JSON.stringify on the

@@ -25,16 +25,22 @@ import (
 
 	homarr "github.com/ydtoloza/homarr/server"
 	"github.com/ydtoloza/homarr/server/internal/api/ctxauth"
+	"github.com/ydtoloza/homarr/server/internal/api/router/analytics"
 	"github.com/ydtoloza/homarr/server/internal/api/router/apikeys"
+	"github.com/ydtoloza/homarr/server/internal/api/router/appmeta"
 	"github.com/ydtoloza/homarr/server/internal/api/router/bangs"
 	"github.com/ydtoloza/homarr/server/internal/api/router/board"
 	dockerrouter "github.com/ydtoloza/homarr/server/internal/api/router/docker"
 	"github.com/ydtoloza/homarr/server/internal/api/router/group"
+	"github.com/ydtoloza/homarr/server/internal/api/router/home"
 	"github.com/ydtoloza/homarr/server/internal/api/router/info"
 	"github.com/ydtoloza/homarr/server/internal/api/router/invite"
+	"github.com/ydtoloza/homarr/server/internal/api/router/location"
+	logrouter "github.com/ydtoloza/homarr/server/internal/api/router/log"
 	"github.com/ydtoloza/homarr/server/internal/api/router/onboard"
 	"github.com/ydtoloza/homarr/server/internal/api/router/searchengine"
 	"github.com/ydtoloza/homarr/server/internal/api/router/serversettings"
+	"github.com/ydtoloza/homarr/server/internal/api/router/updatechecker"
 	"github.com/ydtoloza/homarr/server/internal/api/router/user"
 	"github.com/ydtoloza/homarr/server/internal/api/router/widgets"
 	"github.com/ydtoloza/homarr/server/internal/api/trpc"
@@ -45,6 +51,7 @@ import (
 	"github.com/ydtoloza/homarr/server/internal/httpserver"
 	dockerint "github.com/ydtoloza/homarr/server/internal/integrations/docker"
 	"github.com/ydtoloza/homarr/server/internal/jobs"
+	"github.com/ydtoloza/homarr/server/internal/logging"
 	"github.com/ydtoloza/homarr/server/internal/ws"
 )
 
@@ -94,6 +101,22 @@ func run() error {
 	// produces domain events (ping results, job status) and the WebSocket hub
 	// fans them out to browsers.
 	eventBus := bus.New()
+
+	// Log pipeline: slog records reach the console, the SQLite log store and
+	// the bus ("events.log.<level>") through one bounded async pipeline
+	// (upstream: the pino transports + redis log publisher).
+	logStore, err := logging.NewSQLiteStore(ctx, database)
+	if err != nil {
+		return err
+	}
+	logHandler := logging.NewHandler(logging.Options{
+		Level: logging.LevelInfo,
+		Store: logStore,
+		Bus:   eventBus,
+	})
+	defer logHandler.Close()
+	slog.SetDefault(slog.New(logHandler))
+
 	scheduler := jobs.New(database, eventBus)
 	scheduler.Register(jobs.PingJob(database, eventBus))
 	hub := ws.New(eventBus, websocketSessions(authSvc, database), ws.Options{
@@ -112,6 +135,13 @@ func run() error {
 
 	api := trpc.New()
 	registerRouters(api, database)
+
+	// Log router: tRPC procedures + the log.subscribe WebSocket bridge
+	// (history from the same SQLite store the pipeline writes to).
+	logSvc := logrouter.Register(api, database, logrouter.Options{Store: logStore})
+	for path, handler := range logSvc.SubscriptionHandlers() {
+		hub.Register(path, handler)
+	}
 
 	// Docker domain: endpoints come from the environment (DOCKER_ENDPOINTS /
 	// DOCKER_SOCKET_PATHS / DOCKER_HOST, see DOCKER.md), not the database.
@@ -222,6 +252,11 @@ func registerRouters(api *trpc.Router, database *db.DB) {
 	widgets.Register(api, widgets.Options{
 		ResolveIntegrations: resolveIntegrations(database),
 	})
+	updatechecker.Register(api, database, updatechecker.Options{Version: version})
+	home.Register(api, database, home.Options{})
+	location.Register(api, database, location.Options{})
+	analytics.Register(api, database, analytics.Options{})
+	appmeta.Register(api, database, appmeta.Options{})
 }
 
 // Request-scoped context values consumed by router hooks, mirroring the

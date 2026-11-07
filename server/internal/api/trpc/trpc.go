@@ -28,9 +28,13 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
+
+	"github.com/ydtoloza/homarr/server/internal/bus"
 )
 
 // basePath matches trpcPath in packages/api/src/shared.ts:49 ("/api/trpc"),
@@ -51,6 +55,7 @@ type Procedure func(ctx context.Context, input json.RawMessage) (any, *Error)
 type Router struct {
 	mu    sync.RWMutex
 	procs map[string]Procedure
+	subs  map[string]SubscriptionHandler
 
 	// MaxBatchSize rejects ?batch=1 calls with more operations. Upstream
 	// enforces its own option maxBatchSize with the same BAD_REQUEST message
@@ -59,12 +64,24 @@ type Router struct {
 	// MaxBodyBytes caps the POST body size via http.MaxBytesReader; exceeding
 	// it maps to PAYLOAD_TOO_LARGE.
 	MaxBodyBytes int64
+	// Bus feeds the live data events of SSE subscriptions (see sse.go).
+	// nil (default) means subscriptions deliver their Initial event only —
+	// the composition root sets it after creating the bus, e.g.
+	//
+	//	r := trpc.New()
+	//	r.Bus = eventBus
+	Bus *bus.Bus
+	// SSEPingInterval is the idle interval of SSE ping events (0 = disabled,
+	// the upstream default: sse ping.enabled ?? false and the homarr route
+	// handler configures no sse options).
+	SSEPingInterval time.Duration
 }
 
 // New creates an empty Router with the default limits applied.
 func New() *Router {
 	return &Router{
 		procs:        make(map[string]Procedure),
+		subs:         make(map[string]SubscriptionHandler),
 		MaxBatchSize: 100,
 		MaxBodyBytes: 10 << 20, // 10 MiB
 	}
@@ -189,6 +206,18 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	inputs, parseErr := r.resolveInputs(req, isBatch, len(paths))
 
+	// Single requests to a registered subscription stream SSE (see sse.go):
+	// upstream resolves the response mode from the procedure type, so the
+	// accept header is not consulted here. The batch branch below answers
+	// JSON array envelopes, mirroring resolveResponse where the subscription
+	// case only exists for single calls.
+	if !isBatch {
+		if handler := r.lookupSubscription(path); handler != nil {
+			r.serveSSE(w, req, path, handler, inputs[0], parseErr)
+			return
+		}
+	}
+
 	// M1 executes operations sequentially in op order. Upstream runs them
 	// concurrently (rpcCalls map); a future iteration can fan out with
 	// errgroup while keeping the same output contract.
@@ -199,6 +228,18 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		// and only then the (lazy, per-op) input parsing.
 		proc := r.lookup(p)
 		switch {
+		case isBatch && r.lookupSubscription(p) != nil:
+			// resolveResponse.ts:348-378: subscriptions reject batches after
+			// the method pairing, so POST answers METHOD_NOT_SUPPORTED and
+			// GET (and any other body-less method) BAD_REQUEST. The check
+			// precedes the procedure lookup: a registered subscription is a
+			// procedure upstream, so NOT_FOUND would be wrong.
+			if req.Method == http.MethodPost {
+				outcomes[i] = opOutcome{path: p, err: NewError(CodeMethodNotSupported,
+					`Unsupported POST-request to subscription procedure at path "`+p+`"`)}
+			} else {
+				outcomes[i] = opOutcome{path: p, err: NewError(CodeBadRequest, `Cannot batch subscription calls`)}
+			}
 		case proc == nil:
 			outcomes[i] = opOutcome{path: p,
 				err: NewError(CodeNotFound, `No procedure found on path "`+p+`"`)}
@@ -463,6 +504,9 @@ func marshalPlainEnvelope(o opOutcome) ([]byte, error) {
 		// nil mirrors superjson serializing `undefined`: {"json": undefined}
 		// collapses to {} once JSON.stringify drops the undefined member.
 		data = json.RawMessage("{}")
+	} else if sj, ok := o.data.(SuperJSON); ok {
+		// Pre-transformed payload (see SuperJSON): goes to the wire verbatim.
+		data = json.RawMessage(sj)
 	} else {
 		data = superjsonValue{JSON: o.data}
 	}
@@ -483,6 +527,12 @@ func marshalPlainEnvelope(o opOutcome) ([]byte, error) {
 // transformer per line, jsonl.ts:286-298), hence the {"json": ...} root.
 func writeStream(w http.ResponseWriter, outcomes []opOutcome) {
 	var buf bytes.Buffer
+	// metaValues accumulates the superjson type annotations of SuperJSON
+	// entries, rebased to their position inside the head line (the official
+	// producer serializes the WHOLE line with the transformer, so a Date at
+	// op i's result.data is annotated at "<i>.0.0.result.data.<path>",
+	// stream/jsonl.ts:286-298).
+	metaValues := map[string]string{}
 	buf.WriteString(`{"json":{`)
 	for i := range outcomes {
 		if i > 0 {
@@ -491,16 +541,48 @@ func writeStream(w http.ResponseWriter, outcomes []opOutcome) {
 		buf.WriteByte('"')
 		buf.WriteString(strconv.Itoa(i))
 		buf.WriteString(`":[[`)
-		entry, err := marshalStreamEntry(outcomes[i])
+		entry, entryMeta, err := marshalStreamEntry(i, outcomes[i])
 		if err != nil {
 			outcomes[i] = opOutcome{path: outcomes[i].path, err: NewError(CodeInternalServerError,
 				"Failed to serialize procedure output")}
-			entry, _ = marshalStreamEntry(outcomes[i])
+			entry, entryMeta, _ = marshalStreamEntry(i, outcomes[i])
+		}
+		for path, typeName := range entryMeta {
+			metaValues[path] = typeName
 		}
 		buf.Write(entry)
 		buf.WriteString(`]]`)
 	}
-	buf.WriteString("}}\n")
+	if len(metaValues) == 0 {
+		buf.WriteString("}}\n")
+	} else {
+		// Emit the line-level meta (superjson serialize shape:
+		// {"values": {...}, "v": 1}; superjson src/index.ts serialize).
+		values := make([]string, 0, len(metaValues))
+		for path := range metaValues {
+			values = append(values, path)
+		}
+		sort.Strings(values)
+		buf.WriteString(`},"meta":{"values":{`)
+		for i, path := range values {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			key, err := marshalJSON(path)
+			if err != nil {
+				continue
+			}
+			buf.Write(key)
+			buf.WriteByte(':')
+			typeName, err := marshalJSON(metaValues[path])
+			if err != nil {
+				continue
+			}
+			buf.Write(typeName)
+		}
+		buf.WriteString(`},"v":1}}`)
+		buf.WriteByte('\n')
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -513,23 +595,67 @@ func writeStream(w http.ResponseWriter, outcomes []opOutcome) {
 // marshalStreamEntry builds the EncodedValue payload of one op inside the
 // head line. Success data is NOT wrapped in {"json": ...} here: the per-line
 // superjson wrapping done by writeStream covers it, exactly like the official
-// producer (the line-level transformer walks the whole head).
-func marshalStreamEntry(o opOutcome) ([]byte, error) {
+// producer (the line-level transformer walks the whole head). A SuperJSON
+// entry contributes its annotations rebased to "<i>.0.0.result.data.<path>"
+// instead (see writeStream); its message reaches the line as plain JSON.
+func marshalStreamEntry(i int, o opOutcome) (entry []byte, meta map[string]string, err error) {
 	if o.err != nil {
-		return marshalJSON(struct {
+		entry, err = marshalJSON(struct {
 			Error errorShape `json:"error"`
 		}{Error: o.err.shape(o.path)})
+		return entry, nil, err
 	}
 	if o.data == nil {
-		return []byte(`{"result":{}}`), nil
+		return []byte(`{"result":{}}`), nil, nil
+	}
+	const resultPrefix = ".result.data."
+	if sj, ok := o.data.(SuperJSON); ok {
+		inner, values, perr := splitSuperJSON(sj)
+		if perr != nil {
+			return nil, nil, perr
+		}
+		var buf bytes.Buffer
+		buf.WriteString(`{"result":{"data":`)
+		buf.Write(inner)
+		buf.WriteString(`}}`)
+		if len(values) == 0 {
+			return buf.Bytes(), nil, nil
+		}
+		prefix := strconv.Itoa(i) + ".0.0" + resultPrefix
+		rebased := make(map[string]string, len(values))
+		for path, typeName := range values {
+			rebased[prefix+path] = typeName
+		}
+		return buf.Bytes(), rebased, nil
 	}
 	payload, err := marshalJSON(o.data)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var buf bytes.Buffer
 	buf.WriteString(`{"result":{"data":`)
 	buf.Write(payload)
 	buf.WriteString(`}}`)
-	return buf.Bytes(), nil
+	return buf.Bytes(), nil, nil
+}
+
+// splitSuperJSON splits a SuperJSON envelope into its inner value and type
+// annotations. Envelopes with referential-equality annotations (superjson
+// dedupe) are rejected — homarr-go never produces them.
+func splitSuperJSON(sj SuperJSON) (inner json.RawMessage, values map[string]string, err error) {
+	var decoded struct {
+		JSON json.RawMessage `json:"json"`
+		Meta struct {
+			Values                map[string]string `json:"values"`
+			ReferentialEqualities json.RawMessage   `json:"referentialEqualities"`
+			V                     *int              `json:"v"`
+		} `json:"meta"`
+	}
+	if err := json.Unmarshal([]byte(sj), &decoded); err != nil {
+		return nil, nil, err
+	}
+	if len(decoded.Meta.ReferentialEqualities) > 0 {
+		return nil, nil, errors.New("superjson envelope with referentialEqualities is not supported")
+	}
+	return decoded.JSON, decoded.Meta.Values, nil
 }

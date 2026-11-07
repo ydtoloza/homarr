@@ -73,14 +73,15 @@ func Register(r *trpc.Router, database *db.DB, opts Options) {
 }
 
 // registerBoardRouter mirrors boardRouter (packages/api/src/router/board.ts:265).
-// The only deferred procedure is board.getManageOverview (BOARDS.md section 6).
-// Mutations are wrapped with admin.Writable (the upstream credentialProcedure
-// base middleware, packages/api/src/trpc.ts:130-135).
+// Every upstream procedure of the router is ported; mutations are wrapped
+// with admin.Writable (the upstream credentialProcedure base middleware,
+// packages/api/src/trpc.ts:130-135).
 func registerBoardRouter(r *trpc.Router, s *service) {
 	r.Register("board.exists", s.boardExists)
 	r.Register("board.getPublicBoards", s.boardGetPublicBoards)
 	r.Register("board.getBoardsForGroup", s.boardGetBoardsForGroup)
 	r.Register("board.getAllBoards", s.boardGetAllBoards)
+	r.Register("board.getManageOverview", s.boardGetManageOverview)
 	r.Register("board.catalog", s.boardCatalog)
 	r.Register("board.search", s.boardSearch)
 	r.Register("board.createBoard", admin.Writable(s.boardCreateBoard))
@@ -109,8 +110,9 @@ func registerSectionRouter(r *trpc.Router, s *service) {
 	r.Register("section.changeCollapsed", admin.Writable(s.sectionChangeCollapsed))
 }
 
-// registerAppRouter mirrors appRouter (packages/api/src/router/app.ts:23-330).
-// app.detectMetadata is deferred (external website fetch + icon search).
+// registerAppRouter mirrors appRouter (packages/api/src/router/app.ts:23-330)
+// minus app.detectMetadata, which the appmeta package registers (it drags
+// the guarded-fetch machinery of the metadata detection with it).
 func registerAppRouter(r *trpc.Router, s *service) {
 	r.Register("app.getPaginated", s.appGetPaginated)
 	r.Register("app.all", s.appAll)

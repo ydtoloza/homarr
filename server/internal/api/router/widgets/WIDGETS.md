@@ -1,29 +1,38 @@
 # WIDGETS.md — router de widgets (`internal/api/router/widgets`)
 
 Documento de referencia del port en Go del dominio de widgets de
-`packages/api/src/router/widgets`: hoy `mediaOrganizerRouter` (media-organizer.ts)
-y `downloadsRouter` (downloads.ts), las dos superficies de datos de los
-widgets media-organizer y downloads. Complementa MEDIA_ORGANIZER.md y
-DOWNLOAD_CLIENT.md (clientes) y PROTOCOL.md (wire). Fecha: 2026-11-07.
+`packages/api/src/router/widgets`: hoy `mediaOrganizerRouter` (media-organizer.ts),
+`downloadsRouter` (downloads.ts), `mediaServerRouter` (media-server.ts) y
+`dnsHoleRouter` (dns-hole.ts) — las superficies de datos de los widgets
+media-organizer, downloads, media-server y dns-hole. Complementa
+MEDIA_ORGANIZER.md, DOWNLOAD_CLIENT.md, MEDIA_SERVER.md y NETWORK.md
+(clientes) y PROTOCOL.md (wire). Fecha: 2026-11-07.
 
 Fuentes citadas (todas en este repo):
 
 - **[mo]** `packages/api/src/router/widgets/media-organizer.ts:9-47`.
 - **[dc]** `packages/api/src/router/widgets/downloads.ts:49-194`.
+- **[ms]** `packages/api/src/router/widgets/media-server.ts:9-47`.
+- **[dns]** `packages/api/src/router/widgets/dns-hole.ts:28-97`.
 - **[idx]** `packages/api/src/router/widgets/index.ts` (montaje
-  `mediaOrganizer`/`downloads` bajo `widget`).
+  `mediaOrganizer`/`downloads`/`mediaServer`/`dnsHole` bajo `widget`).
 - **[settle]** `packages/api/src/settle-integrations.ts`
   (PUBLIC_INTEGRATION_ERROR :7, throw :52-66).
 - **[mw]** `packages/api/src/middlewares/integration.ts`
-  (createManyWidgetIntegrationMiddleware :218-230, NOT_FOUND :186-192,
-  FORBIDDEN :266-296, decryptSecret de decryptedSecrets :205-212).
+  (createManyWidgetIntegrationMiddleware :218-230, createOne... :241-247,
+  NOT_FOUND many :186-192, NOT_FOUND one :113-117, FORBIDDEN :266-296,
+  decryptSecret de decryptedSecrets :205-212).
 - **[rh-mo]** `packages/request-handler/src/media-organizer.ts`
   (caché 60 s), **[rh-dc]** `packages/request-handler/src/downloads.ts`
-  (caché 10 s), **[rh-core]** `packages/request-handler/src/lib/request-handler.ts`
-  (DEFAULT_REQUEST_TIMEOUT_MS 60_000 :35, sin stale-if-error).
+  (caché 10 s), **[rh-ms]** `packages/request-handler/src/media-server.ts`
+  (caché 10 s por DEFAULT_TTL_MS), **[rh-dns]**
+  `packages/request-handler/src/dns-hole.ts` (caché 10 s por DEFAULT_TTL_MS),
+  **[rh-core]** `packages/request-handler/src/lib/request-handler.ts`
+  (DEFAULT_REQUEST_TIMEOUT_MS 60_000 :35, DEFAULT_TTL_MS 10_000 :34, sin
+  stale-if-error).
 - **[enc]** `packages/common/src/encryption.ts` (AES-256-CBC, key de
   SECRET_ENCRYPTION_KEY, formato `"<data hex>.<iv hex>"`).
-- **[map]** `packages/definitions/src/widget-integration-map.ts:141,148`
+- **[map]** `packages/definitions/src/widget-integration-map.ts:128,129,138,141,148`
   + `packages/definitions/src/integration.ts` (categorías).
 - **[cred]** `packages/api/src/trpc.ts:130-135` (credentialProcedure) y
   :163-172 (protectedProcedure).
@@ -36,18 +45,36 @@ widgets.Register(r, widgets.Options{ResolveIntegrations: ..., /* factories opcio
 // chi: r.Handle("/api/trpc/*", r.Handler())
 ```
 
-Procedimientos registrados (paths exactos de [mo]/[dc] montados en el
-sub-router `widget` de [idx]):
+Procedimientos registrados (paths exactos de [mo]/[dc]/[ms]/[dns] montados
+en el sub-router `widget` de [idx]):
 
 | Path | Tipo | Permiso upstream | Port |
 |---|---|---|---|
 | `widget.mediaOrganizer.getData` | query | publicProcedure + middleware "query"/mediaMissing | público (sin gate de sesión) |
 | `widget.downloads.getJobsAndStatuses` | query | publicProcedure + middleware "query"/downloads | público |
+| `widget.mediaServer.getCurrentStreams` | query | publicProcedure + middleware "query"/mediaServer | público |
+| `widget.dnsHole.summary` | query | publicProcedure + middleware "query"/dnsHoleSummary | público |
 | `widget.downloads.pause` | mutation | protectedProcedure + "interact" | `admin.Writable` + RequireSignedIn |
 | `widget.downloads.pauseItem` | mutation | ídem | ídem |
 | `widget.downloads.resume` | mutation | ídem | ídem |
 | `widget.downloads.resumeItem` | mutation | ídem | ídem |
 | `widget.downloads.deleteItem` | mutation | ídem | ídem |
+| `widget.dnsHole.enable` | mutation | protectedProcedure + one-middleware "interact"/dnsHoleControls | `admin.Writable` + RequireSignedIn (convención del paquete) |
+| `widget.dnsHole.disable` | mutation | ídem | ídem |
+
+Kinds soportados por widget (`widgets.SupportedKinds`, orden de definición
+upstream de `getIntegrationKindsByCategory`, con "mock" último):
+
+| Widget kind | Kinds |
+|---|---|
+| `mediaMissing` | `sonarr,sportarr,radarr,bindery,mock` |
+| `downloads` | `sabNzbd,nzbGet,deluge,transmission,qBittorrent,aria2,slskd,mock` |
+| `mediaServer` | `jellyfin,emby,plex,navidrome,mock` |
+| `dnsHoleSummary` / `dnsHoleControls` | `piHole,adGuardHome,technitiumDns,mock` |
+
+Los kinds sin cliente portado (`navidrome`, `technitiumDns`, los `mock`)
+fallan SOLO esa integración (la query responde su fallback público), el
+equivalente del fallo en runtime upstream.
 
 Orden de gates de una mutación (el orden upstream de middlewares):
 **read-only key** (`admin.Writable`, credProcedure es la base) →
@@ -83,13 +110,17 @@ Contrato de errores:
   integrations").
 
 El router descifra los secretos con `Options.SecretDecryptor` (default:
-`widgets.DefaultSecretDecryptor`, el cifrado upstream — ver §6) y llama a
-`Options.NewMediaOrganizer` / `Options.NewDownloadClient` (default:
-dispatch por kind a los clientes de `internal/integrations/{mediaorganizer,
-downloadclient}`). Un kind sin cliente (`sportarr`, `nzbGet`, `mock`…) falla
-SOLO esa integración (la query responde su fallback público), el equivalente
-del fallo en runtime upstream. Tests: inyectar factories falsas (ver
-widgets_test.go).
+`widgets.DefaultSecretDecryptor`, el cifrado upstream — ver §8) y llama a
+`Options.NewMediaOrganizer` / `Options.NewDownloadClient` /
+`Options.NewMediaServer` / `Options.NewNetwork` (default: dispatch por kind
+a los clientes de `internal/integrations/{mediaorganizer,downloadclient,
+mediaserver,network}`). `NewNetwork` recibe además el `context.Context` del
+request porque la construcción del cliente pi-hole SONDEA la versión del
+servidor (v5/v6 — ver NETWORK.md §2.1). Un kind sin cliente (`sportarr`,
+`nzbGet`, `navidrome`, `technitiumDns`, `mock`…) falla SOLO esa
+integración (la query responde su fallback público), el equivalente del
+fallo en runtime upstream. Tests: inyectar factories falsas (ver
+widgets_test.go y widgets_mediaserver_network_test.go).
 
 ## 3. `widget.mediaOrganizer.getData` ([mo])
 
@@ -118,9 +149,75 @@ integraciones fallan (y había al menos una) la query responde
 INTERNAL_SERVER_ERROR **"All integration queries failed"**; con
 `integrationIds: []` responde `[]`.
 
-## 4. `widget.downloads.*` ([dc])
+## 4. `widget.mediaServer.getCurrentStreams` ([ms])
 
-### 4.1 getJobsAndStatuses (query)
+Input: `{integrationIds: string[], showOnlyPlaying: boolean}` — el
+middleware parsea `integrationIds` PRIMERO (un showOnlyPlaying ausente con
+ids desconocidos responde NOT_FOUND, como el pageSize de §3), luego el
+input del procedimiento (`showOnlyPlaying` boolean OBLIGATORIO, sin
+default). Salida por integración, en el orden pedido:
+
+```jsonc
+// éxito (error: undefined se descarta en superjson)
+{"integrationId":"…","integrationName":"…","integrationKind":"plex",
+ "sessions":[StreamSession…]}
+// fallo de ESA integración
+{"integrationId":"…","integrationName":"…","integrationKind":"plex",
+ "sessions":[],"error":"INTEGRATION_REQUEST_FAILED"}
+```
+
+A diferencia de downloads/dns-hole NO hay objeto `integration` anidado ni
+`updatedAt`: upstream devuelve `integrationKind` como campo plano
+([ms] :27-33). `throwOnAllFailures: true` (§3). Caché de **10 s**
+(DEFAULT_TTL_MS — [rh-ms] no fija `cacheTtlMs`) con clave
+`<integrationId> + hash({showOnlyPlaying})`. El tipo wire `StreamSession`
+está pinneado byte a byte en MEDIA_SERVER.md §1 (incluido el tri-estado
+ausente|null|valor de `episodeName`/`episodeCount` vía `mediaserver.Optional`).
+
+## 5. `widget.dnsHole.*` ([dns])
+
+### 5.1 summary (query)
+
+Input: `{integrationIds}` (middleware only, sin input de procedimiento).
+Salida por integración:
+
+```jsonc
+// éxito — updatedAt es el timestamp de la caché (ISO-ms con Z)
+{"integrationId":"…","integrationName":"…",
+ "integration":{"id":"…","name":"…","kind":"piHole","updatedAt":"…"},
+ "summary":{"status":"enabled"?,"domainsBeingBlocked":…,"adsBlockedToday":…,
+            "adsBlockedTodayPercentage":…,"dnsQueriesToday":…}}
+// fallo — summary null, error constante, integration SIN updatedAt
+{"integrationId":"…","integrationName":"…",
+ "integration":{"id":"…","name":"…","kind":"piHole"},
+ "summary":null,"error":"INTEGRATION_REQUEST_FAILED"}
+```
+
+`status` es OPCIONAL en el wire (v6 descarta "failed"/"unknown" — NETWORK.md
+§1). `throwOnAllFailures` idéntico a §3. Caché de **10 s** (DEFAULT_TTL_MS).
+
+### 5.2 enable / disable (mutations, one-middleware)
+
+- Input de enable: `{integrationId: string}`; de disable:
+  `{integrationId: string, duration?: number}` (segundos; presente y
+  no-número ⇒ BAD_REQUEST).
+- Cardenalidad UNO: el middleware de una integración tiene mensaje
+  NOT_FOUND PROPIO ([mw] :113-117) —
+  `Integration with id <id> not found or not of kinds <kinds>` —; el port
+  lo modela con `ResolveRequest.Cardinality` ("one"/"many") que el
+  resolver real (M4) debe respetar.
+- Ejecución: se construye el cliente, corre `Enable`/`Disable(duration)`
+  y SOLO después de un éxito se invalida la caché del integrationId
+  ([dns] :72-75 — un fallo NO invalida, a diferencia de downloads §6.2).
+- Errores: el PRIMER (único) fallo responde INTERNAL_SERVER_ERROR con el
+  mensaje crudo del cliente — los Error planos de pi-hole v5/adguard
+  ("Failed to enable PiHole for …") y la ResponseError de v6
+  ("Response did not indicate success") viajan verbatim (getTRPCError
+  FromUnknown upstream). Éxito ⇒ void.
+
+## 6. `widget.downloads.*` ([dc])
+
+### 6.1 getJobsAndStatuses (query)
 
 Input: `{integrationIds, limitPerIntegration?: number (default 50, sin
 mínimo), selection?: {sort: enum14, descending, categoryFilter: string[≤100]
@@ -150,7 +247,7 @@ DOWNLOAD_CLIENT.md). Caché de **10 s** con clave
 fingerprint de secretos; el port equivale porque las mutaciones invalidan).
 `throwOnAllFailures` idéntico a §3.
 
-### 4.2 Mutaciones ([dc] :122-194)
+### 6.2 Mutaciones ([dc] :122-194)
 
 - `pause` / `resume`: input `{integrationIds}`; corren
   `PauseQueue`/`ResumeQueue` en TODAS las integraciones resueltas
@@ -166,7 +263,7 @@ fingerprint de secretos; el port equivale porque las mutaciones invalidan).
   did not indicate success" / "An unknown error occured…"). Éxito ⇒ void
   (`{"result":{"data":{}}}` en el wire).
 
-## 5. Paralelismo y timeouts
+## 7. Paralelismo y timeouts
 
 - Entre integraciones: `Options.Parallelism` (default 10 — upstream NO acota
   `Promise.allSettled`; desviación documentada como en el job ping).
@@ -176,7 +273,7 @@ fingerprint de secretos; el port equivale porque las mutaciones invalidan).
   60 s de la capa request-handler); los clientes @ctrl traen 5 s por request
   (qbit/transmission/deluge). El `ctx` del procedimiento corta todo.
 
-## 6. Secretos ([enc])
+## 8. Secretos ([enc])
 
 `integrationSecret.value` = `"<data hex>.<iv hex>"` — AES-**256-CBC** con
 PKCS#7 (no AES-GCM: la nota de INTEGRATIONS.md §7.3 estaba desactualizada;
@@ -192,7 +289,7 @@ descifrado falla, la query responde INTERNAL_SERVER_ERROR (el error del
 middleware upstream sería idéntico: decryptSecret lanza dentro del
 middleware).
 
-## 7. Cobertura de tests
+## 9. Cobertura de tests
 
 Harness: `trpc.Router` real sobre httptest con sesión por header
 (`X-Test-User`, patrón board) y clientes falsos inyectados por factory.
@@ -214,11 +311,28 @@ Harness: `trpc.Router` real sobre httptest con sesión por header
 | `TestDownloadsMutationsRunOnAllIntegrations` | pause en TODAS, interact al resolver, item validado y transportado, fromDisk, item inválido ⇒ BAD_REQUEST |
 | `TestDownloadsMutationFailureSurfacesIntegrationMessage` | primer fallo ⇒ 500 "Request to integration failed" |
 | `TestDownloadsCacheInvalidation`, `TestMediaOrganizerCacheTTL` | caché TTL (override de test), single-flight, invalidación por mutación |
-| `TestSecretRoundtrip`, `TestDecryptUpstreamVector` (vector Node real), `TestDecryptMalformed`, `TestDecryptDefaultsToZeroKey` | cifrado §6 |
+| `TestSecretRoundtrip`, `TestDecryptUpstreamVector` (vector Node real), `TestDecryptMalformed`, `TestDecryptDefaultsToZeroKey` | cifrado §8 |
+
+Los tests de media-server y dns-hole viven en
+widgets_mediaserver_network_test.go con el MISMO harness (resolver y
+clientes falsos por factory):
+
+| Test | Cubre |
+|---|---|
+| `TestMediaServerGetCurrentStreamsSuccessShape` | entrada de éxito byte-exacto (integrationKind plano, tri-estado de sessions), request del resolver (mediaServer) |
+| `TestMediaServerInputValidation` | showOnlyPlaying obligatorio ⇒ BAD_REQUEST; NOT_FOUND del middleware-many gana al boolean ausente (resolver nil) |
+| `TestMediaServerFallbackAndAllFailures`, `TestMediaServerEmptyIntegrationIDs` | fallback público exacto, todas fallan ⇒ 500, `[]` ⇒ `[]` |
+| `TestMediaServerCacheTTL` | caché 10 s (override), single-flight, showOnlyPlaying parte de la clave |
+| `TestDNSHoleSummarySuccessShape`, `TestDNSHoleSummaryFailureShape` | forma de éxito (updatedAt ISO-ms) y de fallo (summary null) byte-exactas + throwOnAllFailures |
+| `TestDNSHoleMutationsRequireSession` | anónimo ⇒ UNAUTHORIZED; read-only ⇒ FORBIDDEN |
+| `TestDNSHoleMutations` | interact/dnsHoleControls/Cardinality one, integrationId único, duration forwardada y nil, duration inválida ⇒ BAD_REQUEST |
+| `TestDNSHoleOneNotFoundMessage` | mensaje NOT_FOUND EXACTO del one-middleware |
+| `TestDNSHoleMutationFailureSurfacesExactMessage` | el mensaje crudo del cliente viaja (500) |
+| `TestDNSHoleMutationInvalidation` | invalidación SOLO tras éxito (fallo no invalida) |
 
 Ejecución: `go test ./internal/api/router/widgets/...`.
 
-## 8. Pendientes / preguntas para el integrador
+## 10. Pendientes / preguntas para el integrador
 
 1. **Resolver DB-backed**: escribir el `ResolveIntegrations` real (SQL sobre
    `integration` + `integrationSecret` + permisos de

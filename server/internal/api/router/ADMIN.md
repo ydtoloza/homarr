@@ -635,3 +635,164 @@ envelopes tRPC son parte de las aserciones.
 
 Ejecución: `go test ./internal/api/router/... ./internal/db/...` (solo
 stdlib + las deps del módulo).
+
+
+## 10. Routers M4: log, updateChecker, home, location, analytics y app.detectMetadata
+
+Seis dominios portados en M4, uno por paquete con la firma uniforme
+`Register(r *trpc.Router, database *db.DB, opts Options)`. Complementan este
+documento: `PROTOCOL.md` §10 (el formato SSE que sirve `log.subscribe`),
+`WEBSOCKET.md` §6/§8 (el mapa de topics del bus y la excepción SSE) y
+`BOARDS.md` §6 (el un-defer de `getManageOverview`).
+
+### 10.1 log (`packages/api/src/router/log.ts`) — paquete `log/`
+
+`log.subscribe` es la única suscripción del router (log.ts:19-84):
+`permissionRequiredProcedure.requiresPermission("other-view-logs")`, input
+`{levels: LogLevel[]}` con default `["info"]` (un array vacío es válido y
+filtra todo). Emite `{type:"history", messages}` inicial (la tabla `log` de
+`internal/logging`, filtrada y oldest-first como el `getRecentAsync` upstream)
+y luego `{type:"message", message}` por evento vivo del bus.
+
+- **Forma de los payloads**: superjson con la anotación
+  `{"timestamp": "Date"}` en `meta.values` — el terminal del SPA llama
+  `message.timestamp.getTime()` (terminal.tsx:96), así que la fecha DEBE
+  reconstruirse como Date en el cliente. El contrato vive en
+  `trpc.WrapJSONWithMeta`/`trpc.SuperJSON` (superjson.go) y los handlers
+  devuelven `trpc.SuperJSON` en Initial y Decode (el lado WS ya envolvía con
+  `trpc.WrapJSON`, que ahora pasa esos envelopes verbatim).
+- **Topics del bus**: `events.log.<level>` — el pipeline de `internal/logging`
+  publica el envelope superjson del LoggerMessage (lo mismo que upstream
+  PUBLISHa); el handler suscribe `events.log.*` y filtra por niveles en el
+  `Decode` (el orden armado-de-bus → Initial elimina duplicados; la
+  microventana documentada en WEBSOCKET.md §6 se mantiene).
+- **Doble transporte**: `Register` registra la suscripción en el registro SSE
+  del router tRPC (`RegisterSubscription`) y devuelve `*Service` con
+  `SubscriptionHandlers()` para el hub WS (la convención de docker).
+- **Errores**: anónimo → UNAUTHORIZED; sin el permiso expandido → FORBIDDEN
+  "Permission denied"; nivel inválido → BAD_REQUEST (el enum de
+  `zodEnumFromArray`).
+
+### 10.2 updateChecker (`router/update-checker.ts` + `request-handler/src/update-checker.ts`) — paquete `updatechecker/`
+
+`updateChecker.getAvailableUpdates` (admin, query). Porta el request handler
+completo: caché fresca 24h + caché stale + single-flight (el lock Redis de
+upstream es cross-proceso; en un proceso es single-flight), fetch de
+`https://api.github.com/repos/homarr-labs/homarr/releases` (cabeceras octokit:
+`accept: application/vnd.github+json`, User-Agent), filtrado semver (tags no
+semver descartados, prereleases ocultos salvo que la versión actual lo sea —
+flag `prerelease` de GitHub, tag de la versión actual), estrictamente
+posteriores a la versión actual, orden descendente. Stale-if-error: un fallo
+sirve el payload stale (o vacío) y lo cachea como fresco por otras 24h
+("suppressing retries for 24 hours"); el router traga cualquier error en una
+lista vacía ("An empty list hides the indicator", update-checker.ts:15-17).
+Salida: `[{name, contentHtml?, url, tagName, isPrerelease}]` (contentHtml
+omitido cuando la release no trae body_html). `Options{Version, ReleasesURL,
+CacheTTL, Now, Client}` son las costuras de test.
+
+### 10.3 home (`router/home.ts`) — paquete `home/`
+
+`home.getStats` (público): las tarjetas de estadísticas del dashboard de
+gestión, en el orden exacto de inserción upstream
+board→user→invite→integration→app→group→searchEngine→media, cada una solo
+cuando la página detrás es alcanzable para el caller
+(`getAppManagementAccess`/`getIntegrationManagementAccess` de
+definitions/permissions.ts:231-254). Notas: `isProviderEnabled("credentials")`
+es siempre true (fork credentials-only); el conteo de boards replica el
+filtro `or(isPublic, creatorId, inArray(boardIds))` de home.ts:103-120 con
+los boardIds de permisos directos + de grupo; la tarjeta de integration
+cuenta los integrations con permiso "full" delegado cuando no hay
+`integration-full-all` (`getFullAccessIntegrationIdsAsync`); app cuenta solo
+con `app-modify-all` (0 si solo `app-create`); media filtra por `creator_id`
+sin `media-view-all`. Salida: `[{titleKey, subtitleKey, count, path}]`.
+
+### 10.4 location (`router/location.ts`) — paquete `location/`
+
+`location.searchCity` (público, `{query}`): proxy de
+`https://geocoding-api.open-meteo.com/v1/search?name=<query>` con el timeout
+de 10s (`withTimeoutAsync`, igual que bangs). El OUTPUT schema se porta
+completo (location.ts:24-41): `{results: [city]}` con las claves exactas
+`{id, name, country?, country_code?, latitude, longitude, population?}` —
+zod recorta las claves desconocidas de la API y los opcionales ausentes se
+omiten; un objeto con solo `generationtime_ms` cae a `{results: []}` (el
+refine exige que sea la ÚNICA clave); cualquier otra forma es un fallo de
+validación de salida → INTERNAL_SERVER_ERROR (upstream no chequea `res.ok`:
+un body de error de la API simplemente no valida). Sin
+`env.NO_EXTERNAL_CONNECTION` (misma decisión que bangs).
+
+### 10.5 analytics (`router/analytics.ts` + `packages/analytics/src`) — paquete `analytics/`
+
+`analytics.sendAnalytics` (admin, mutation, guard read-only): devuelve
+`{status}` con la semántica exacta de `sendSnapshotAsync`:
+
+| status | condición |
+|---|---|
+| `disabled` | `analytics.enableGeneral = false` (settings leídos al inicio y re-leídos tras recolectar, send-server-analytics.ts:206-208) |
+| `skipped` | la última snapshot exitosa tiene menos de 7 días (`isSnapshotDue`, snapshot-properties.ts:3-9) |
+| `sent` | snapshot capturada en PostHog y `lastSuccessfulSnapshotAt` avanzado |
+| `failed` | cualquier error — INCLUIDA la fila `analytics` ausente de una instancia fresca (el CAS `updateAnalyticsServerSettingAsync` lanza "Analytics server settings are missing" y el catch degrada, send-server-analytics.ts:223-226) |
+
+La snapshot recolecta las ~25 métricas de send-server-analytics.ts:99-205
+via SQL sobre el mismo esquema (counts de 21 tablas, distribuciones por kind
+de integration/item/layout/section, buckets de tamaño de board,
+`omitZeroCounts` — las claves `count*` en 0 se omiten, y
+`countBoardsWithStatusEnabled` desaparece con `forceDisableStatus`), y
+captura UN evento `server-analytics` a `https://hog.homarr.dev/batch/` con
+la api key de client.ts:5-6, el uuid derivado de
+`sha256(instanceId:periodo7d:server-analytics)` (getSnapshotUuid) y
+`$geoip_disable`/`$process_person_profile: false`. La actualización de
+settings conserva el CAS de 5 intentos upstream (server-setting.ts:66-90);
+las llamadas concurrentes comparten la snapshot en vuelo (el
+`pendingSnapshot` promise). Desviaciones documentadas: el frame PostHog es
+un POST directo de `/batch/` (los internals de posthog-node no son
+load-bearing para Homarr), `databaseType` siempre "sqlite", `authProviders`
+siempre `["credentials"]`, `env.NO_EXTERNAL_CONNECTION` no portado.
+
+### 10.6 app.detectMetadata (`router/app.ts:227-239`) — paquete `appmeta/`
+
+Mutation `app-create` (guard read-only incluido) con input
+`{href: trimmed http(s) URL}` (iconsDetectFaviconSchema). Flujo portado:
+
+1. `fetchWebsiteMetadataAsync` (packages/icons/src/favicon-fetcher.ts,
+   favicon.go + guardedfetch.go del paquete): fetch SSRF-guarded de la
+   página (Accept text/html, 5s por hop con DNS re-verificado por conexión
+   y listas de bloqueo de loopback/link-local/metadata cloud, máx 5
+   redirects manuales, head de 256 KiB cortado en `</head`/`<body`),
+   `<title>` (entidades decodificadas, whitespace colapsado) y
+   `<link rel=icon>` rankeados por relación (apple-touch-icon-precomposed >
+   apple-touch-icon > icon > shortcut icon) y área de `sizes`, con el
+   fallback `/favicon.ico` del origen que respondió (probe por
+   content-type). Nada lanza: sitio inalcanzable → metadatos nulos.
+2. `name = (title ?? hostname).slice(0, 64)` (app.ts:236; el slice upstream
+   cuenta unidades UTF-16, el port bytes — solo un corte en multibyte lo
+   nota).
+3. `iconUrl = metadata.iconUrl ?? getIconForName(db, name) ?? defaultIcon`
+   (app.ts:238) — la búsqueda de iconos es la primera fila de `icon` con
+   `name LIKE %name%` SIN escapar (los %/_ del nombre son comodines también
+   upstream, auto-icon-searcher.ts:5-9), repo nuevo `db/icon.go`; el default
+   es el icono homarr de jsdelivr (app.ts:21).
+
+Salida `{name, iconUrl}` nunca nulos (el output schema app.ts:232). El
+procedimiento vive en su propio paquete (el board package lleva el resto del
+app router) con el path punteado intacto; los tests usan un sitio httptest y
+filas de icon sembradas.
+
+### 10.7 Registro
+
+```go
+log.Register(r, database, log.Options{Store: logStore})          // "log.subscribe" (SSE + WS)
+updatechecker.Register(r, database, updatechecker.Options{})     // "updateChecker.getAvailableUpdates"
+home.Register(r, database, home.Options{})                       // "home.getStats"
+location.Register(r, database, location.Options{})               // "location.searchCity"
+analytics.Register(r, database, analytics.Options{})             // "analytics.sendAnalytics"
+appmeta.Register(r, database, appmeta.DefaultOptions())          // "app.detectMetadata"
+```
+
+`log.Register` devuelve `*Service`: además del registro SSE, el integrador
+cablea `for path, handler := range logSvc.SubscriptionHandlers() {
+hub.Register(path, handler) }` (WEBSOCKET.md §11). El pipeline de logs se
+construye antes: `logStore, _ := logging.NewSQLiteStore(ctx, db)` y
+`slog.SetDefault(slog.New(logging.NewHandler(logging.Options{Level:
+logLevel, Store: logStore, Bus: eventBus})))` (LOG_LEVEL env, default info).
+`r.Bus = eventBus` antes de registrar routers para que las suscripciones SSE
+tengan bus.

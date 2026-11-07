@@ -34,6 +34,8 @@ func Register(r *trpc.Router, opts Options) {
 	s := newService(opts)
 	registerMediaOrganizerRouter(r, s)
 	registerDownloadsRouter(r, s)
+	registerMediaServerRouter(r, s)
+	registerDNSHoleRouter(r, s)
 }
 
 // registerMediaOrganizerRouter mirrors mediaOrganizerRouter
@@ -54,4 +56,21 @@ func registerDownloadsRouter(r *trpc.Router, s *service) {
 	r.Register("widget.downloads.resume", admin.Writable(s.protected(s.downloadsResume)))
 	r.Register("widget.downloads.resumeItem", admin.Writable(s.protected(s.downloadsResumeItem)))
 	r.Register("widget.downloads.deleteItem", admin.Writable(s.protected(s.downloadsDeleteItem)))
+}
+
+// registerMediaServerRouter mirrors mediaServerRouter
+// (packages/api/src/router/widgets/media-server.ts:9-47).
+func registerMediaServerRouter(r *trpc.Router, s *service) {
+	r.Register("widget.mediaServer.getCurrentStreams", s.mediaServerGetCurrentStreams)
+}
+
+// registerDNSHoleRouter mirrors dnsHoleRouter
+// (packages/api/src/router/widgets/dns-hole.ts:28-97). The enable/disable
+// mutations follow the same house gates as the downloads mutations
+// (protectedProcedure + the credentialProcedure read-only port), even though
+// upstream chains only protectedProcedure + the one-integration middleware.
+func registerDNSHoleRouter(r *trpc.Router, s *service) {
+	r.Register("widget.dnsHole.summary", s.dnsHoleSummary)
+	r.Register("widget.dnsHole.enable", admin.Writable(s.protected(s.dnsHoleEnable)))
+	r.Register("widget.dnsHole.disable", admin.Writable(s.protected(s.dnsHoleDisable)))
 }

@@ -247,17 +247,17 @@ genera para parseo de inputs (usa BAD_REQUEST); queda reservado/aceptado.
 - **WebSocket** `/websockets` ([homarr] `apps/websocket/src/main.ts`): tRPC WS
   `{id, method: query|mutation|subscription, params: {path, input}}` con
   superjson, `reconnect`/`stop`/`subscription.state`; keepAlive ping 30 s.
-  Se porta en M3 (`server/internal/ws`).
-- **SSE** (`httpSubscriptionLink`) para `widget.beszel.subscribeSystemStats`:
-  `Content-Type: text/event-stream`, eventos tRPC con superjson y
-  `withCredentials`. Requiere procedimientos subscription (M3+).
+  Portado en M3 (`server/internal/ws`, WEBSOCKET.md).
+- **SSE** (`httpSubscriptionLink`): portado en M4 — ver la sección 10.
 - **multipart/form-data y octet-stream** (uploads de media): se responde 415
   con mensaje explícito hasta portar los routers de medias.
 - **Mezcla de tipos de procedimiento en un batch**: upstream la rechaza con
   BAD_REQUEST (`contentType.ts:180-192`) porque conoce el tipo de cada
   procedimiento; homarr-go no tipa procedimientos todavía (seam).
-- **`connectionParams`**, `lastEventId`, abort signals por operación,
-  ejecución concurrente de ops del batch (homarr-go es secuencial en M1).
+- **`connectionParams`**, `lastEventId` (los eventos SSE de homarr-go no son
+  `tracked()`, así que no hay `id:` ni reanudación), abort signals por
+  operación, ejecución concurrente de ops del batch (homarr-go es secuencial
+  en M1).
 
 ## 8. Comprobación con superjson real (lo que debe esperar el integrador)
 
@@ -290,3 +290,83 @@ Validación pendiente del integrador (M1): capturar tráfico real del frontend
 (devtools) contra el server Go y comparar — los tests fijan el wire byte a
 byte según las fuentes citadas, pero el SPA real añade cookies/sesión y
 combinaciones de batch que conviene verificar en caliente.
+
+## 10. SSE — suscripciones por `httpSubscriptionLink` (M4)
+
+Portado en `server/internal/api/trpc/sse.go`. Fuentes: **[trpc]** tag
+`v11.18.0` — `packages/server/src/unstable-core-do-not-import/stream/sse.ts`
+(productor `sseStreamProducer`, consumidor `sseStreamConsumer`, cabeceras
+`sseHeaders`) y `http/resolveResponse.ts:458-540` (rama `subscription`); el
+cliente es `packages/client/src/links/httpSubscriptionLink.ts` del SPA
+(`trpc.tsx:194-200`: `Accept: text/event-stream` sobre la URL tRPC normal,
+GET single sin `batch`).
+
+### 10.1 Cuándo responde SSE
+
+Upstream decide el modo por el TIPO del procedimiento (una suscripción
+resuelve la rama subscription en `resolveResponse` con independencia del
+header accept), así que homarr-go lo decide por registro: un path registrado
+con `Router.RegisterSubscription(path, handler)` es una suscripción y las
+peticiones SINGLE (no batch) a él emiten el stream SSE. Los paths no
+registrados conservan el envelope NOT_FOUND clásico (§3) — exactamente lo que
+upstream responde a un path desconocido (tipo `unknown` → rama httpLink).
+Los lotes que contienen un path de suscripción fallan por operación
+(`resolveResponse.ts:348-378`): POST → METHOD_NOT_SUPPORTED
+`Unsupported POST-request to subscription procedure at path "<p>"`, y GET →
+BAD_REQUEST `Cannot batch subscription calls`.
+
+Errores ANTES de abrir el stream (HEAD/OPTIONS, batch máximo, stream sin
+batch, content-type inválido) siguen siendo JSON clásico: upstream los
+resuelve antes de la rama subscription.
+
+### 10.2 Formato del stream (byte exacto)
+
+Respuesta: **HTTP 200 siempre** con las `sseHeaders` (sse.ts:449-454) +
+CORS/Vary del montaje general:
+
+```
+Content-Type: text/event-stream
+Cache-Control: no-cache, no-transform
+X-Accel-Buffering: no
+Connection: keep-alive
+```
+
+Cada evento son las líneas `event:` (solo eventos nombrados), `data:`, `id:`
+opcional DESPUÉS de data (solo envelopes `tracked()` — ninguna suscripción
+homarr-go lo usa) y el terminador `\n\n` (sse.ts:427-443). El productor
+homarr-go emite exactamente estos eventos:
+
+| Evento | Wire | Cuándo |
+|---|---|---|
+| `connected` | `event: connected\ndata: {}\n\n\n` | siempre, primero — `JSON.stringify(client)` con las opciones de cliente vacías (sse.ts:158; homarr configura ninguna) |
+| (sin nombre) | `data: <superjson>\n\n\n` | cada valor de la suscripción; sin `event:` el EventSource lo despacha como `message` (lo que escucha el consumidor) |
+| `serialized-error` | `event: serialized-error\ndata: {"json":<errorShape>}\n\n\n` | el handler falló o el parseo de input falló; el shape es el `getErrorShape` estándar (§5) envuelto por el transformer |
+| `ping` | `event: ping\ndata: \n\n\n` | keepalive de inactividad — DESACTIVADO por defecto (`ping.enabled ?? false` y el route handler de homarr no configura opciones sse); `Router.SSEPingInterval > 0` lo activa con reinicio por valor (el `withPing` de sse.ts:166-172) |
+| `return` | `event: return\ndata: \n\n\n` | la suscripción completó (cierre del bus); el consumidor cierra el EventSource al recibirlo (sse.ts:134-138) |
+
+Un error del handler NO corta la conexión con un status: el stream abre 200,
+emite `connected` y luego un único `serialized-error` (el `errorToAsyncIterable`
+de `resolveResponse.ts:32-36` alimentando el catch del productor,
+sse.ts:209-225) y termina. Los errores del iterable a mitad de stream serían
+igualmente `serialized-error`; el Decode del handler no puede fallar (solo
+filtra).
+
+Los datos viajan envueltos por el transformer de salida (superjson):
+`{"json": <valor>}` para payloads planos, o el envelope completo con
+`meta.values` cuando el payload necesita reconstrucción de tipos — el
+contrato `trpc.SuperJSON` de superjson.go (los timestamps Date de
+`log.subscribe` viajan anotados: el terminal del SPA llama
+`message.timestamp.getTime()`, terminal.tsx:96).
+
+### 10.3 El registro de suscripciones
+
+`RegisterSubscription(path, SubscriptionHandler)` con la misma forma que
+`ws.SubscriptionHandler` (WEBSOCKET.md §9): `Subscribe(ctx, *SubscriptionRequest{Path,
+Input, Session}) → (*Subscription{Initial, Pattern, Decode}, error)`. `Initial`
+es el primer evento de datos (nil = ninguno), `Pattern` el patrón del bus
+cuyos mensajes se reenvían como eventos de datos ("" = nada; requiere
+`Router.Bus` no nil) y `Decode` filtra/transforma cada mensaje del bus
+(nil = passthrough). El armado del bus ANTECEDE al `Initial` (sin ventana
+perdida entre ambos); los mensajes entre la resolución del historial del
+handler y el armado se pierden como en el lado WS (WEBSOCKET.md §6). En M4
+`log.subscribe` está registrado aquí y en el hub; `beszel` llegará en M5.

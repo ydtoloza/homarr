@@ -2,6 +2,7 @@ package admin
 
 import (
 	"context"
+	"sort"
 
 	"github.com/ydtoloza/homarr/server/internal/api/ctxauth"
 	"github.com/ydtoloza/homarr/server/internal/api/trpc"
@@ -89,6 +90,21 @@ func RequireSignedIn(c Caller) *trpc.Error {
 		return trpc.NewError(trpc.CodeUnauthorized, "UNAUTHORIZED")
 	}
 	return nil
+}
+
+// PermissionKeys returns the expanded permission keys of the caller — the
+// upstream ctx.session.user.permissions array (session.user.permissions =
+// getCurrentUserPermissionsAsync expanded with getPermissionsWithChildren).
+// Administrators do NOT implicitly carry every key here: the array mirrors
+// the expansion of the group permissions, and the fork's administrator flag
+// is honored through HasPermission/IsAdmin.
+func (c Caller) PermissionKeys() []string {
+	keys := make([]string, 0, len(c.groupPermissions))
+	for key := range c.groupPermissions {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // HasPermission reports the permissionRequiredProcedure check

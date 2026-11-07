@@ -98,7 +98,7 @@ Con `board-view-all` en la sesión: sin filtro.
 | `board.getPublicBoards` | 280 | público | — | `[{id,name,logoImageUrl}]` | ✅ port |
 | `board.getBoardsForGroup` | 290 | `admin` | `{groupId}` | `[{id,name,logoImageUrl}]` | ✅ port |
 | `board.getAllBoards` | 321 | público | `void` | `boardSummary[]` (§4.1) | ✅ port |
-| `board.getManageOverview` | 375 | público (con `userId` solo admin) | `{fullPreview?,previewRowLimit?,userId?}` opcional | `board+preview[]` | ⏸ diferido (§6) |
+| `board.getManageOverview` | 375 | público (con `userId` solo admin) | `{fullPreview?,previewRowLimit?,userId?}` opcional | `board+preview[]` | ✅ port (M4, manageoverview.go) |
 | `board.catalog` | 640 | público | — | `[{id,name,logoImageUrl,permissions,isHome,isMobileHome}]` | ✅ port |
 | `board.search` | 643 | público | `{query, limit=10 (1-100)}` | ídem | ✅ port |
 | `board.createBoard` | 652 | `board-create` | `{name, columnCount(1-24), isPublic}` | `{boardId,name,layoutId}` | ✅ port |
@@ -144,7 +144,7 @@ tras `containerSectionOptionsSchema`, [val-shared] shared.ts:67-77).
 | `app.byId` | 158 | público + AppAccessControl | `{id}` | `App` | ✅ port |
 | `app.byIds` | 186 | público + AppAccessControl | `string[]` | `App[]` | ✅ port |
 | `app.create` | 190 | `app-create` | `{name,description,iconUrl,href,pingUrl}` | `{appId, ...App}` | ✅ port |
-| `app.detectMetadata` | 227 | `app-create` | `{href}` | `{name,iconUrl}` | ⏸ diferido (§6) |
+| `app.detectMetadata` | 227 | `app-create` | `{href}` | `{name,iconUrl}` | ✅ port M4 en `router/appmeta` (ADMIN.md §10) — no en este paquete |
 | `app.createMany` | 241 | `app-create` | `App[]` (iconUrl nullable, sin trim) | `void` | ✅ port |
 | `app.update` | 256 | `app-modify-all` | `{...app, id}` | `void` | ✅ port³ |
 | `app.delete` | 307 | `app-full-all` | `{id}` | `void` | ✅ port³ |
@@ -172,8 +172,9 @@ keys can still be updated."` (upsert sobre PK `user_id+item_id+key`). El
 gate `itemStateProcedure` ([uis] :12-20) devuelve `NOT_FOUND "Item not
 found"` / `NOT_FOUND "Board not found"`.
 
-**Totales: 40 procedimientos en el dominio — 39 portados, 1 diferido**
-(`board.getManageOverview`, `app.detectMetadata`).
+**Totales: 40 procedimientos en el dominio — 40 portados** (M4 completa el
+dominio: `board.getManageOverview` en manageoverview.go y
+`app.detectMetadata` en el paquete `router/appmeta`).
 
 ## 4. Formas de salida (lo que consume el frontend)
 
@@ -306,8 +307,10 @@ Las salidas `z.void()` llegan como `{"result":{"data":{}}}` (superjson de
 
 | Procedimiento | Motivo |
 |---|---|
-| `board.getManageOverview` | Read-model de previsualización del panel de administración: agrega carriles/lanes, containers visibles e iconos de apps (~260 líneas); pura BD pero enorme y solo la usa esa página. |
-| `app.detectMetadata` | `fetchWebsiteMetadataAsync` (HTTP externo) + búsqueda de iconos; requiere el paquete icons/request-handler. |
+(Ninguno: `board.getManageOverview` se portó en M4 — manageoverview.go,
+§3 — y `app.detectMetadata` vive en el paquete `router/appmeta`, ADMIN.md
+§10. Los diferidos restantes del dominio son los 4 de onboarding, que
+viven en ADMIN.md §6.)
 
 ### 6.1 Algoritmo de grid responsivo (portado)
 

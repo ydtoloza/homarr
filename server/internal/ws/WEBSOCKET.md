@@ -230,7 +230,7 @@ integraciones) y consumido por los handlers de `internal/ws`:
 
 | Suscripción | Topic/patrón bus | Payload (JSON crudo) | Notes |
 |---|---|---|---|
-| `log.subscribe` | `events.log.*` (publicador: el logger del binario) | `LoggerMessage` | el filtro por `levels` lo aplica el `Decode` del handler; la parte "history" es el `Initial` (seam: ring buffer de logs del binario) |
+| `log.subscribe` | `events.log.*` (publicador: el pipeline de `internal/logging`) | el envelope superjson del `LoggerMessage` (`{"json":{id,timestamp,message,level},"meta":{"values":{"timestamp":"Date"},"v":1}}` — exactamente lo que upstream PUBLISHa al canal Redis; la anotación Date es load-bearing: el terminal del SPA llama `timestamp.getTime()`) | el filtro por `levels` lo aplica el `Decode` del handler (los topics exactos son `events.log.<level>`); la parte "history" es el `Initial` (la tabla `log` de SQLite que mantiene `internal/logging`, sustituto aditivo de la lista Redis) |
 | `docker.subscribeLogs` | `events.docker.logs.<endpointId>.<containerId>` (publicador: `internal/integrations/docker`) | chunk de texto | patrón exacto por petición |
 | `cronJobs.subscribeToStatusUpdates` | `events.cronjobs.status.<jobName>` (publicador: `internal/jobs`) | `TaskStatus` | una suscripción escucha `events.cronjobs.status.*` entero |
 | (futuro) ping por app/integración | `events.ping.<id>` | `{url, statusCode, durationMs}` / `{url, error}` | mismo shape del `pingChannel` upstream |
@@ -240,9 +240,11 @@ Redis DENTRO del observable y deduplica el historial con los mensajes
 bufferizados (log.ts:44-69). En homarr-go la suscripción al bus se arma
 después de resolver el `Initial` y antes de arrancar el pump: los mensajes
 publicados en la microventana entre resolución inicial y `bus.Subscribe`
-se pierden (el bus ya es "drop on slow" — eventos efímeros, no cola). El
-handler de logs de M3 puede re-sincronizar desde el ring buffer si le
-importa la ventana.
+se pierden (el bus ya es "drop on slow" — eventos efímeros, no cola). Con
+ese orden no hay duplicados posibles (un mensaje es o historia o evento
+vivo, nunca ambos); upstream deduplica porque suscribe primero. Con la
+tabla `log` de `internal/logging` el historial sobrevive reinicios (la
+lista Redis del compose oficial no).
 
 ## 7. Reconexión y apagado
 
@@ -269,21 +271,20 @@ importa la ventana.
   `/websockets`.
 - Formato del stream (productor `sse.streamProducer`,
   `packages/server/src/unstable-core-do-not-import/stream/sse.ts`): eventos
-  SSE con nombres `connected` (data con el envelope `started`), `data`
-  (superjson), `serialized-error` y `ping`; el cliente los consume en
-  `httpSubscriptionLink.ts:80-237` y puede reanudar con `lastEventId` si el
-  procedimiento usa `tracked()`.
-- **Decisión: NO se implementa en `internal/ws` (queda stub/documentado).**
-  Razones: (1) vive en el lado HTTP tRPC (`/api/trpc/...`), cuyo handler es
-  `internal/api/trpc` — no en este paquete ni en este puerto; (2) el
-  procedimiento requiere la integración beszel (M4); (3) el coste del
-  formato SSE + `tracked()`/`lastEventId` no compensa hasta que exista el
-  procedimiento. Cuando toque: añadir en `internal/api/trpc` la rama
-  `Accept: text/event-stream` para procedimientos subscription (ver
-  PROTOCOL.md §7, que ya lo lista como fuera de alcance) y registrar el
-  procedimiento en el router de widgets. Mientras tanto, si algo pregunta
-  por ese path por WS recibirá el `NOT_FOUND` estándar — situación
-  irrelevante porque el SPA nunca lo manda por WS.
+  SSE con nombres `connected`, `data` (superjson), `serialized-error`, `ping`
+  y `return`; el cliente los consume en `httpSubscriptionLink.ts` y puede
+  reanudar con `lastEventId` solo si el procedimiento usa `tracked()`
+  (ninguna suscripción homarr-go lo usa).
+- **IMPLEMENTADO en M4 — pero en `internal/api/trpc`, no en este paquete**
+  (PROTOCOL.md §10): el transporte vive en el lado HTTP tRPC, cuyo handler
+  es el paquete `trpc`. El registro es un seam aparte
+  (`trpc.Router.RegisterSubscription`) con la misma forma
+  Initial/Pattern/Decode de este paquete, así que un mismo servicio sirve
+  ambos transportes con adaptadores finos (así lo hace `log.subscribe`:
+  `SubscriptionHandlers()` para el hub y `RegisterSubscription` para SSE).
+  `beszel` se bridará en M5 sobre el mismo seam. Mientras un path de
+  suscripción no esté registrado, una petición SSE recibe el envelope
+  NOT_FOUND clásico (no un frame WS).
 
 ## 9. Implementación Go
 
@@ -370,7 +371,9 @@ suite completa.
 3. **Cableado del apagado**: llamar `hub.Close()` en el camino de SIGTERM
    del binario, después de los productores del bus (§7).
 4. **Productores del bus**: los handlers de este paquete ya consumen los
-   topics del §6; `internal/jobs` (cron status, log publisher) e
-   `internal/integrations/docker` (stream de logs) deben publicarlos.
+   topics del §6; `internal/logging` ya publica `events.log.<level>` (M4),
+   `internal/jobs` (cron status) e `internal/integrations/docker` (stream de
+   logs) publican los suyos. El cableado del registro es
+   `for path, handler := range logSvc.SubscriptionHandlers() { hub.Register(path, handler) }`.
 5. **SSE beszel**: decidir M4+ (§8) — requiere el lado HTTP de
    `internal/api/trpc`, no este paquete.
