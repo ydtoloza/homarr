@@ -38,18 +38,21 @@ type service struct {
 // Register registers the serverSettings router under its upstream paths.
 func Register(r *trpc.Router, database *db.DB, _ Options) {
 	s := &service{db: database}
-	// serverSettings.getCulture (serverSettings.ts:83-85): public.
+	// serverSettings.getCulture (serverSettings.ts:83-85): public (query).
 	r.Register("serverSettings.getCulture", s.getCulture)
-	// serverSettings.getAll (serverSettings.ts:86-88): admin.
+	// serverSettings.getAll (serverSettings.ts:86-88): admin (query).
 	r.Register("serverSettings.getAll", s.getAll)
-	// serverSettings.getBranding (serverSettings.ts:89-96): public.
+	// serverSettings.getBranding (serverSettings.ts:89-96): public (query).
 	r.Register("serverSettings.getBranding", s.getBranding)
-	// serverSettings.getBoardSettings (serverSettings.ts:97-119): admin.
+	// serverSettings.getBoardSettings (serverSettings.ts:97-119): admin
+	// (query).
 	r.Register("serverSettings.getBoardSettings", s.getBoardSettings)
-	// serverSettings.updateBoardSettings (serverSettings.ts:120-142): admin.
-	r.Register("serverSettings.updateBoardSettings", s.updateBoardSettings)
-	// serverSettings.saveSettings (serverSettings.ts:143-183): admin.
-	r.Register("serverSettings.saveSettings", s.saveSettings)
+	// serverSettings.updateBoardSettings (serverSettings.ts:120-142): admin
+	// (mutation).
+	r.Register("serverSettings.updateBoardSettings", admin.Writable(s.updateBoardSettings))
+	// serverSettings.saveSettings (serverSettings.ts:143-183): admin
+	// (mutation).
+	r.Register("serverSettings.saveSettings", admin.Writable(s.saveSettings))
 }
 
 // getServerSettingByKey is getServerSettingByKeyAsync

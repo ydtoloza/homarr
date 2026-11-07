@@ -17,6 +17,11 @@
 //
 // They are intentionally NOT registered, exactly like the deferred board
 // procedures (BOARDS.md §6): callers get the standard NOT_FOUND envelope.
+//
+// The package also hosts ClaimHandler (claimrest.go): the REST route
+// POST /api/onboarding/claim that MINTS the onboarding claim the tRPC gates
+// verify. It is a plain http.Handler, mounted by the integrator behind the
+// auth middleware (ADMIN.md §3.5).
 package onboard
 
 import (
@@ -59,8 +64,9 @@ func Register(r *trpc.Router, database *db.DB, opts Options) {
 	s := &service{db: database, opts: &opts}
 	// onboard.currentStep (onboard-router.ts:140): publicProcedure.
 	r.Register("onboard.currentStep", s.currentStep)
-	// onboard.nextStep (onboard-router.ts:142-148): onboardingClaimedProcedure.
-	r.Register("onboard.nextStep", s.nextStep)
+	// onboard.nextStep (onboard-router.ts:142-148):
+	// onboardingClaimedProcedure (mutation).
+	r.Register("onboard.nextStep", admin.Writable(s.nextStep))
 }
 
 // currentStep is onboard.currentStep: getOnboardingOrFallbackAsync

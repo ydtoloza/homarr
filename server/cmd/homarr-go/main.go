@@ -114,11 +114,12 @@ func run() error {
 	srv := &http.Server{
 		Addr: ":" + cfg.Port,
 		Handler: httpserver.New(httpserver.Options{
-			Static:     homarr.Sub(),
-			TRPC:       authSvc.Middleware()(withRequestMeta(api.Handler())),
-			Auth:       authSvc.Handler(),
-			WebSockets: hub.Handler(),
-			Version:    version,
+			Static:          homarr.Sub(),
+			TRPC:            authSvc.Middleware()(withRequestMeta(api.Handler())),
+			Auth:            authSvc.Handler(),
+			WebSockets:      hub.Handler(),
+			OnboardingClaim: authSvc.Middleware()(onboard.ClaimHandler(database)),
+			Version:         version,
 		}),
 		ReadHeaderTimeout: 10 * time.Second,
 	}

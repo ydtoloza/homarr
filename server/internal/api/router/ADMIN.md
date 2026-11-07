@@ -12,12 +12,13 @@ Fuentes citadas (todas en este repo):
 - **[user]** `packages/api/src/router/user.ts` + `router/user/preferences.ts`.
 - **[group]** `packages/api/src/router/group.ts`.
 - **[invite]** `packages/api/src/router/invite.ts` + `router/invite/checks.ts`.
-- **[onboard]** `packages/api/src/router/onboard/onboard-router.ts` + `onboard-queries.ts`, **[claim]** `packages/api/src/onboarding-claim.ts`.
+- **[onboard]** `packages/api/src/router/onboard/onboard-router.ts` + `onboard-queries.ts`, **[claim]** `packages/api/src/onboarding-claim.ts`, **[claim-rest]** `apps/nextjs/src/app/api/onboarding/claim/route.ts`.
 - **[settings]** `packages/api/src/router/serverSettings.ts`, **[ss-def]** `packages/server-settings/src/index.ts`, **[ss-q]** `packages/db/queries/server-setting.ts` (+ `queries/group.ts`).
 - **[se]** `packages/api/src/router/search-engine/search-engine-router.ts`.
-- **[bangs]** `packages/api/src/router/bangs/bangs-router.ts` + `packages/request-handler/src/duckduckgo-bangs.ts`.
+- **[bangs]** `packages/api/src/router/bangs/bangs-router.ts` + `packages/api/src/services/duckduckgo-bangs.ts` + `packages/request-handler/src/duckduckgo-bangs.ts` + `packages/request-handler/src/lib/request-handler.ts`.
 - **[keys]** `packages/api/src/router/apiKeys.ts`.
 - **[info]** `packages/api/src/router/info.ts`.
+- **[cred-access]** `packages/api/src/credential-access.ts`, **[resp-err]** `packages/common/src/errors/http/response-error.ts`, **[ddg-timeout]** `packages/core/src/infrastructure/http/timeout.ts`.
 - **[val-user]** `packages/validation/src/user.ts`, **[val-group]** `group.ts`, **[val-se]** `search-engine.ts`, **[val-common]** `common.ts`, **[val-onb]** `onboarding.ts`, **[val-hdr]** `header-preferences.ts`, **[val-email]** `email.ts`.
 - **[def]** `packages/definitions/src/{permissions,group,onboarding,user}.ts`.
 - **[auth]** `AUTH.md` (bcrypt cost 10, formato de API keys), **[schema]** `SCHEMA.md`, **[trpc]** `../trpc/trpc.go` + `superjson.go`.
@@ -32,10 +33,17 @@ invite.Register(r, database, invite.Options{})      // "invite.*"      (3)
 onboard.Register(r, database, onboard.Options{})    // "onboard.*"     (2 + 4 diferidos)
 serversettings.Register(r, database, serversettings.Options{}) // "serverSettings.*" (6)
 searchengine.Register(r, database, searchengine.Options{})     // "searchEngine.*"   (9)
-bangs.Register(r, database, bangs.Options{})        // "bangs.*"       (0 + 1 diferido)
+bangs.Register(r, database, bangs.Options{})        // "bangs.*"       (1)
 apikeys.Register(r, database, apikeys.Options{})    // "apiKeys.*"     (5)
 info.Register(r, database, info.Options{})          // "info.*"        (3)
 // chi: r.Handle("/api/trpc/*", r.Handler())
+```
+
+Además del tRPC, el endpoint REST del claim de onboarding se monta junto a
+los demás (`onboard.ClaimHandler`, §3.5):
+
+```go
+router.Handle("/api/onboarding/claim", auth.Middleware()(onboard.ClaimHandler(database)))
 ```
 
 Los paths son los punteados exactos de [root] `packages/api/src/root.ts`
@@ -54,6 +62,10 @@ pánico por path duplicado lo emite `trpc.Router.Register`.
 - `group.Options{OnboardingClaimTokenFromContext}` e
   `onboard.Options{OnboardingClaimTokenFromContext}` — ídem para
   `group.createInitialExternalGroup` y `onboard.nextStep`.
+- `bangs.Options{CatalogURL, CacheTTL}` — `CatalogURL` sobreescribe
+  `https://duckduckgo.com/bang.js` (`bangs.DefaultCatalogURL`,
+  duckduckgo-bangs.ts:11; costura de test); `CacheTTL` sobreescribe los
+  10s del request-handler (costura de test, §3.8).
 - `info.Options{Version, DemoMode, DemoReadOnly}` — `Version` sobreescribe
   la versión reportada (default `"2.11.1"`, el `version` del package.json
   raíz); `isDemoReadOnly` = `DemoMode && DemoReadOnly` ([info]
@@ -73,9 +85,56 @@ viven en el paquete compartido `router/internal/admin` (`Caller`,
 | `permissionRequiredProcedure.requiresPermission(p)` sin el permiso | `FORBIDDEN "Permission denied"` |
 | `onboardingClaimedProcedure` sin admin ni claim válido | `FORBIDDEN "This onboarding session is not claimed."` |
 | `onboardingProcedure.requiresStep(s)` con otro paso | `FORBIDDEN "Step denied"` |
+| mutación con API key `readOnly` (trpc.ts:130-135) | `FORBIDDEN "This credential only permits read-only operations"` |
 
 ⚠️ `permissionRequiredProcedure` extiende `protectedProcedure`
 (trpc.ts:195-207): un anónimo recibe **UNAUTHORIZED**, no FORBIDDEN.
+
+### 2.1 API keys read-only (credencial de solo lectura)
+
+`credentialProcedure` ([trpc] trpc.ts:130-135) es la base de TODOS los
+procedimientos upstream (public/protected/permissionRequired/
+onboardingClaimed/internal): una sesión con `apiKey.readOnly` puede ejecutar
+queries pero **toda mutación** responde
+`FORBIDDEN` con mensaje fijo — el mensaje exacto es
+**"This credential only permits read-only operations"** (trpc.ts:132). La
+condición `isReadOnlyProcedure` ([cred-access] credential-access.ts:5-6) es
+`type === "query" && meta.readOnly !== false`: mutaciones siempre rechazadas;
+ningún router de este dominio declara `meta.readOnly === false` (solo existen
+en icons/custom-widget/integration/widgets upstream).
+
+Port en `internal/admin/readonly.go`: `admin.RequireWritable(c Caller)` es el
+helper canónico y `admin.Writable(proc)` la costura de registro — envuelve la
+mutación en `Register` para que el rechazo conserve el orden upstream
+(middleware base: ANTES de los gates de permisos y de la validación de
+entrada; una mutación con cuerpo inválido y key read-only responde el error
+read-only, no BAD_REQUEST). Solo mira `ctxauth.Session.ReadOnly` (sin SQL):
+el middleware de auth lo rellena al resolver la API key (AUTH.md §6).
+
+Mutaciones con el guard aplicado (40 en total):
+
+- **user** (20): `initUser`, `register`, `create`, `setProfileImage`,
+  `editProfile`, `delete`, `changePassword`, `updatePreferences`,
+  `changeHomeBoards`, `changeDefaultSearchEngine`, `changeSearchPreferences`,
+  `changeColorScheme`, `changeByteUnitSystem`,
+  `changeEnableRightClickOnWidgets`, `changePingIconsEnabled`,
+  `changeHeaderPreferences`, `changeDdgBangs`, `changeFirstDayOfWeek`,
+  `completeTour`, `resetTours`. Lecturas sin guard: `getAll`, `selectable`,
+  `search`, `getPreferences`, `getById`, `getTourStatus`.
+- **group** (10): `createInitialExternalGroup`, `createGroup`,
+  `updateGroup`, `savePartialSettings`, `savePositions`, `savePermissions`,
+  `transferOwnership`, `deleteGroup`, `addMember`, `removeMember`.
+- **invite** (2): `createInvite`, `deleteInvite` (`getAll` es lectura).
+- **serverSettings** (2): `updateBoardSettings`, `saveSettings`.
+- **searchEngine** (3): `create`, `update`, `delete`.
+- **apiKeys** (3): `revokeOwnOAuth`, `create`, `delete`.
+- **onboard** (1): `nextStep`.
+
+⚠️ **Pendiente para el integrador**: el paquete `board/**` (otro agente lo
+está portando en paralelo) necesita el mismo guard en sus mutaciones —
+envolver con `admin.Writable` las que upstream declara `.mutation(...)`
+(crear/guardar boards, secciones, items, posiciones, etc.). Hasta entonces
+una API key read-only puede mutar boards a través de esos procedimientos.
 
 Checks propios de procedimientos (replicados uno a uno):
 
@@ -107,7 +166,8 @@ Checks propios de procedimientos (replicados uno a uno):
 
 ## 3. Inventario de procedimientos
 
-**Totales del dominio: 74 upstream — 69 portados, 5 diferidos.**
+**Totales del dominio: 74 upstream — 70 portados, 4 diferidos** (+ el
+endpoint REST `POST /api/onboarding/claim`, no-tRPC, portado en §3.5).
 
 ### user ([user] user.ts — 26 procedimientos, todos portados)
 
@@ -220,10 +280,61 @@ BAD_REQUEST.
 El claim (`__onboarding_claim` en serverSetting, [claim]
 onboarding-claim.ts:8): registro JSON crudo `{"hash": sha256hex(token),
 "expiresAt": epochMs}` — verificación constant-time (subtle) con
-`expiresAt > now`; administrador pasa siempre. El endpoint REST que emite
-el claim (`POST /api/onboarding/claim`,
-`apps/nextjs/src/app/api/onboarding/claim/route.ts`) NO es tRPC: queda
-para la capa httpserver (M4).
+`expiresAt > now`; administrador pasa siempre. La EMISIÓN vive en
+`admin.ClaimOnboarding` (claimOnboardingAsync, onboarding-claim.ts:78-117,
+§3.5) y el endpoint REST que la consume es `onboard.ClaimHandler`.
+
+### 3.5 Endpoint REST del claim — `POST /api/onboarding/claim`
+
+Port byte-exacto de [claim-rest] `route.ts` (53 líneas) en
+`onboard/claimrest.go`: `ClaimHandler(database *db.DB) http.Handler`, que se
+monta DETRÁS de `auth.Middleware()` (§1) y lee el caller con
+`ctxauth.FromContext`. Flujo:
+
+1. `Sec-Fetch-Site` presente y distinto de `same-origin`/`none` → **403**
+   `{"code":"cross_site"}` (route.ts:14-17; callers sin el header pasan).
+2. `force` = `session?.user.permissions.includes("admin")` (route.ts:22) ≙
+   `ctxauth.Session.IsAdministrator` (el middleware de auth lo deriva del
+   permiso de grupo `admin`; un anónimo fuerza `false`).
+3. `claimOnboardingAsync(db, {currentToken: <cookie>,
+   force})` — la cookie se extrae del header `Cookie` crudo con
+   `getOnboardingClaimTokenFromCookieHeader` (onboarding-claim.ts:44-60:
+   split `;`, primer `=`, trim, `decodeURIComponent`, escape inválido ⇒ sin
+   token). Matriz de estados → HTTP:
+
+   | Estado (claimOnboardingAsync) | HTTP | Body | Extra |
+   |---|---|---|---|
+   | `finished` (paso raw `finish`) | **409** | `{"code":"finished"}` | Set-Cookie que borra `homarr-onboarding-claim` |
+   | `forbidden` (hay usuario y sin `force`) | **403** | `{"code":"administrator_required"}` | — |
+   | `locked` (claim ajeno no expirado y sin `force`) | **423** | `{"code":"locked","expiresAt":epochMs}` | `Cache-Control: no-store` |
+   | `issued` (nuevo token) / `active` (re-claim del mismo token) | **200** | `{"status":"issued"\|"active","expiresAt":epochMs}` | `Cache-Control: no-store` + Set-Cookie |
+   | (default inalcanzable, route.ts:35-37) | **409** | `{"code":"unavailable"}` | — |
+
+4. Set-Cookie de issued/active (route.ts:45-51):
+   `homarr-onboarding-claim=<token>; Path=/; Expires=<expiresAt>; HttpOnly;
+   SameSite=Strict` + `Secure` si `x-forwarded-proto` (primer valor,
+   recortado) es `https` o el request llegó por TLS. Método distinto de POST
+   → **405** (route.ts exporta solo POST). Los bodies `finished`/`forbidden`
+   NO llevan `no-store` upstream; el port lo replica.
+
+Semántica de `claimOnboardingAsync` (onboarding-claim.ts:78-117, portada en
+`admin.ClaimOnboarding`): token = 32 bytes aleatorios base64url (solo su
+sha256hex se almacena, con `expiresAt` = now + **4h**
+`onboardingClaimTtlMs`); el propio token vigente del caller gana primero
+(`active`), el lock (`locked`) y el `forbidden` ceden ante `force` del
+administrador (que ROTA el claim); la fila previa se borra solo mientras
+conserva el valor leído (borrado optimista, `db.DeleteServerSettingIfValue`)
+y si el INSERT pierde la carrera de PK se relee la fila ganadora: no
+expirada ⇒ `locked`, otro error ⇒ 500.
+
+Desviaciones documentadas: (1) el Set-Cookie de borrado lleva `Path=/` —
+Next `cookies.delete` no emite Path y por RFC 6265 no limpiaría la cookie
+`Path=/`; el port emite la cookie vacía con `Expires` en el pasado, `Path=/`,
+HttpOnly y SameSite=Strict; (2) montado detrás de `auth.Middleware()` una
+cabecera `ApiKey` inválida responde 401 plano (upstream `auth()` no valida
+API keys en esta ruta; behavioral igual para el SPA, que nunca manda esa
+cabecera aquí); (3) un error interno del claim responde `500
+{"code":"internal_error"}` JSON en vez de la página de error de Next.
 
 ### serverSettings ([settings] serverSettings.ts — 6 procedimientos, todos portados)
 
@@ -260,14 +371,53 @@ lectura devuelve los defaults íntegros (parseBrandingSettings).
 | `searchEngine.update` | 194 | `search-engine-modify-all` | NOT_FOUND; **no actualiza `short`** (edit schema lo omite) |
 | `searchEngine.delete` | 221 | `search-engine-full-all` | limpia `user.default_search_engine_id` antes de borrar |
 
-### bangs ([bangs] bangs-router.ts — 0 portados, 1 diferido)
+### bangs ([bangs] bangs-router.ts — 1 procedimiento, portado)
 
-`bangs.search` (público, `{query, limit 1-50 default 20}`) **NO es un
-dataset estático upstream**: proxyea
-`https://duckduckgo.com/bang.js` (~13k entradas) vía
-`@homarr/request-handler/duckduckgo-bangs` (fetch + normaliza + ordena +
-caché). Diferido a la capa HTTP externa; `bangs.Register` no registra nada
-y las llamadas reciben el envelope NOT_FOUND estándar.
+`bangs.search` (público, `{query, limit 1-50 default 20}`, query) es un
+proxy del catálogo de bangs de DuckDuckGo
+(`https://duckduckgo.com/bang.js`, ~13k entradas) — NO es un dataset
+estático. Port en `bangs/register.go` (el stub vacío fue reemplazado;
+firma `Register(r, db, Options)` intacta, la base de datos no se usa):
+
+- **Forma de salida** (`duckDuckGoBangSchema`, duckduckgo-bangs.ts:23-31):
+  array de `{t, s, d?, u, c?, sc?, r?}` — `t` token del bang, `s` nombre,
+  `u` plantilla URL con `{{{s}}}`, y opcionales `d` (dominio), `c`
+  (categoría), `sc` (subcategoría), `r` (rank numérico). Los opcionales se
+  omiten cuando el origen no los trae (zod + superjson); claves desconocidas
+  del origen se descartan. El spotlight solo consume `t`/`s`/`u`
+  (search-engines-search-group.tsx:409-472).
+- **Pipeline del fetch** (requestAsync, duckduckgo-bangs.ts:40-72): GET con
+  `accept: application/json,text/plain,*/*`; timeout de **10s**
+  (`withTimeoutAsync` default, [ddg-timeout] timeout.ts:6); respuesta no-2xx
+  ⇒ error con el mensaje exacto de `ResponseError`
+  **"Response did not indicate success"** ([resp-err]
+  response-error.ts:13) que tRPC envuelve como `INTERNAL_SERVER_ERROR`
+  (el mensaje viaja intacto por `getMessageFromUnknownError`); schema
+  zod: `t/s/u` requeridos — una entrada inválida rechaza el catálogo entero
+  (500); token normalizado a `lowercase+trim`, entradas con token vacío
+  descartadas, orden estable ascendente por `t`.
+- **Búsqueda** (`searchDuckDuckGoBangsAsync`, services/duckduckgo-bangs.ts:
+  35-55): token de consulta normalizado igual; vacío ⇒ `[]`; búsqueda
+  binaria del lower bound sobre el catálogo ordenado y recolección de los
+  matches de prefijo consecutivos hasta `limit`.
+- **Caché** (`createRequestHandler`, request-handler.ts): TTL in-memory de
+  **10 segundos** — el handler upstream no fija `cacheTtlMs`, así que aplica
+  `DEFAULT_TTL_MS = 10_000` (request-handler.ts:31); sin stale-if-error
+  (`fallbackToStaleOnError` sin fijar ⇒ tras expirar, un fallo del upstream
+  llega al caller y nada stale se sirve); dedup de fetches concurrentes
+  (mapa inflight upstream, single-flight en el port); el fallo no se cachea
+  (cada llamada fallida re-intenta).
+
+Desviaciones documentadas: caché solo in-memory por proceso (upstream añade
+opcionalmente una capa Redis compartida tras la misma interfaz; el fork es
+un proceso único, ARCHITECTURE.md §2); orden byte-wise (`strings.Compare`)
+en vez de JS `localeCompare` — sort y búsqueda usan el MISMO comparador, así
+que la agrupación por prefijo de la búsqueda binaria se conserva y solo el
+ORDEN de resultados alrededor de símbolos/mayúsculas puede diferir; un
+payload schema-inválido produce un mensaje descriptivo en vez del dump de
+issues de zod (ambos 500); `env.NO_EXTERNAL_CONNECTION` (devuelve `[]` en
+upstream) no se porta; un `null` JSON en un campo opcional se trata como
+ausente (upstream zod lo rechazaría; bang.js nunca emite nulls).
 
 ### apiKeys ([keys] apiKeys.ts — 5 procedimientos, todos portados)
 
@@ -354,7 +504,14 @@ y las llamadas reciben el envelope NOT_FOUND estándar.
     mode", "Password changes are disabled in demo mode", "Username changes
     are disabled in demo mode") quedan tras el flag para paridad futura.
 11. **Bangs**: sin tabla (el dataset vive en duckduckgo.com); no hay
-    `db/bangs.go` porque no hay SQL que portar.
+    `db/bangs.go` porque no hay SQL que portar. El proxy está portado
+    (§3 bangs) con caché in-memory TTL 10s y las desviaciones listadas ahí.
+12. **Guard read-only como wrapper de registro**: `admin.Writable` envuelve
+    la mutación en el punto de `Register` (§2.1) en lugar de inyectar el
+    chequeo en cada handler: garantiza completitud (nueva mutación sin
+    envolver = visible en diffs del registro) y replica el orden upstream
+    (middleware base antes de permisos/validación) sin consultas extra a la
+    base (solo mira la sesión del contexto).
 
 ## 6. Procedimientos diferidos (y por qué)
 
@@ -364,12 +521,11 @@ y las llamadas reciben el envelope NOT_FOUND estándar.
 | `onboard.testIntegration` | `testConnectionAsync` del router de integraciones (HTTP externo + MissingSecretError). |
 | `onboard.discoverDockerServices` | Docker Engine API (`@homarr/docker`, M3). |
 | `onboard.detectRuntimeCapabilities` | probes docker/workshop (env + HTTP externo). |
-| `bangs.search` | fetch externo a duckduckgo.com/bang.js + caché del request-handler (§3 bangs). |
 
 Los 4 de onboarding son los pasos "setup" del wizard: hasta que se porten,
 el asistente queda funcional en start → user → group y el paso setup
 responderá NOT_FOUND (el resto del wizard de M2 — usuario/grupo/invites —
-está completo).
+está completo). `bangs.search` dejó de estar diferido (§3 bangs).
 
 ## 7. Preguntas abiertas para el integrador
 
@@ -378,10 +534,15 @@ está completo).
    natural es soportar `meta.values` en `trpc.WrapJSON`
    (superjson.go:20-24 ya deja la costura anotada); los handlers ya
    producen el ISO exacto que superjson emitiría.
-2. **Endpoint REST del claim de onboarding** (`POST /api/onboarding/claim`,
-   cookie `homarr-onboarding-claim` HttpOnly SameSite=strict): pertenece a
-   httpserver; los routers ya verifican el token vía
-   `Options.OnboardingClaimTokenFromContext`.
+2. **Montaje del endpoint REST del claim** (`POST /api/onboarding/claim`,
+   ya portado como `onboard.ClaimHandler`, §3.5): falta el wiring en
+   httpserver —
+   `router.Handle("/api/onboarding/claim", auth.Middleware()(onboard.ClaimHandler(database)))`.
+   Los routers ya verifican el token vía
+   `Options.OnboardingClaimTokenFromContext` (el middleware de httpserver
+   debe seguir extrayendo la cookie `homarr-onboarding-claim` para esas
+   rutas tRPC). Nota: detrás de `auth.Middleware()` una cabecera `ApiKey`
+   inválida responde 401 plano en esta ruta (§3.5 desviación 2).
 3. **Versionado de `info.getInfo`**: hoy `Options.Version` default
    `"2.11.1"` (package.json raíz upstream); conviene inyectarlo en el
    build (`-ldflags`) cuando el fork lleve su propia versión.
@@ -403,6 +564,12 @@ está completo).
 - `db/onboard.go` (nuevo): fila de onboarding, transición de paso
   (rowCount para el CONFLICT), `UpdateOnboardingAll` (el UPDATE sin WHERE
   de nextOnboardingStepAsync), `HasAnyUser`.
+- `db/onboardingclaim.go` (nuevo): `DeleteServerSettingIfValue` — el
+  borrado optimista de `claimOnboardingAsync` (onboarding-claim.ts:97-101):
+  solo elimina la fila `__onboarding_claim` mientras conserva el valor
+  leído, de modo que la fila de un emisor concurrente sobrevive y el INSERT
+  perdedor detecta al ganador (§3.5). Lectura/insert usa los repos de
+  `db/serversettings.go`.
 - `db/serversettings.go` (nuevo): get/list/insert/update/upsert/delete de
   `serverSetting` (valores superjson crudos; la interpretación es del
   router).
@@ -445,14 +612,26 @@ envelopes tRPC son parte de las aserciones.
 | `invite` | `TestInviteLifecycle` | gates, createInvite (token 40 hex), getAll (orden por expiración, creator, SIN token), deleteInvite (NOT_FOUND), formato ISO de expirationDate |
 | | `TestInviteValidation` | fecha inválida y sin offset ⇒ BAD_REQUEST |
 | `onboard` | `TestOnboardingCurrentStepAndNext` | fila ausente ⇒ start, gate de claim (forbidden sin claim), transición con claim, PRECONDITION_FAILED en el segundo nextStep, claim expirado rechazado |
+| | `TestClaimHandlerIssuedActiveLocked` | handler REST §3.5: issued (200 + cookie HttpOnly/SameSite=Strict/Path/Expires + no-store + hash sin token en DB), re-claim active, locked 423 con expiresAt, rotación por admin (token anterior invalidado) |
+| | `TestClaimHandlerFinishedForbidden` | finished 409 + cookie borrada (valor vacío, Expires pasado), forbidden tras el primer usuario (también para el navegador con claim: upstream chequea usuario antes del token activo) |
+| | `TestClaimHandlerCrossSiteAndMethod` | Sec-Fetch-Site cross-site/same-site 403 cross_site, same-origin/none pasan, Secure por x-forwarded-proto (primer valor), 405 en GET |
+| | `TestClaimHandlerUnauthenticatedAdminOverrideIsNotForced` | anónimo tras el primer usuario ⇒ 403 administrator_required |
+| | `TestOnboardingClaimTokenFromCookieHeader` | parser del header Cookie (spec onboarding-claim.spec.ts:76-83): match exacto, %2D decodificado, escape inválido, nombre similar, valor vacío |
+| | `TestClaimOnboardingExpiredRotation` | claimOnboardingAsync: tras expirar se re-emite y el token viejo no valida (spec :49-60) |
 | `serversettings` | `TestServerSettingsReadShapes` | getCulture/getBranding (defaults completos), gates de getBoardSettings/getAll, shape byte-exacto del board default |
 | | `TestUpdateBoardSettings` | merge parcial, board privada/inexistente con mensaje exacto, tipos erróneos, gates |
 | | `TestSaveSettingsBranches` | merge genérico (culture), analytics estricto (clave desconocida BAD_REQUEST + defaults preservados), branding con legacy keys, settingsKey desconocido |
 | `searchengine` | `TestSearchEngineCRUD` | escalera de permisos create/modify/full, shape de fila (nulls), unión discriminada (urlTemplate sin `%s`, nombre largo), update sin tocar short, NOT_FOUND, catalog anónimo (solo generic) vs firmado (con integration), search por prefijo, getPaginated, delete con detach de defaults |
 | | `TestGetDefaultSearchEngine` | default de server (anónimo, generic), default de usuario, limpieza del default huérfano en lectura |
 | `apikeys` | `TestAPIKeyLifecycle` | gates, formato `id.token` (8+48 hex), bcrypt verify contra el hash almacenado (y rechazo de token erróneo), getAll con user, delete + readOnly roundtrip |
+| `user` | `TestReadOnlyAPIKeyEnforcement` | guard §2.1: getTourStatus OK con key read-only, changeColorScheme 403 "This credential only permits read-only operations", sesión normal sin efecto, orden (cuerpo inválido ⇒ error read-only, no BAD_REQUEST), completeTour cubierto |
 | `info` | `TestInfoRouter` / `TestInfoOptionsOverride` | UNAUTHORIZED anónimo, shape byte-exacto de la versión, demo flags |
-| `bangs` | `TestBangsSearchDeferred` | `bangs.search` NO registrado ⇒ NOT_FOUND (fija el diferido) |
+| `bangs` | `TestBangsSearchShapeAndOrder` | proxy portado: matches de prefijo ordenados, forma byte-exacta `{t,s,d,u,c,sc,r}` (opcionales omitidos, clave desconocida `x` descartada), normalización del token, query vacía/sin match `[]`, límite, header accept del fetch |
+| | `TestBangsSearchInputValidation` | zod del input: query requerido, limit 1-50 default 20, no-entero/strings ⇒ BAD_REQUEST |
+| | `TestBangsSearchCache` | caché TTL: 1 fetch dentro de la ventana, re-fetch tras expirar (TTL real 10s reducido a 30ms en el harness) |
+| | `TestBangsSearchUpstreamError` | 500 upstream ⇒ 500 INTERNAL_SERVER_ERROR "Response did not indicate success" (mensaje exacto de ResponseError), fallo no cacheado, re-intento y recuperación |
+| | `TestBangsSearchInvalidCatalog` | schema zod del catálogo: falta t/s/u, tipos erróneos, no-array, JSON inválido ⇒ 500 (rechazo del array entero) |
+| | `TestBangsSearchDefaultsToRealUpstream` | `bangs.DefaultCatalogURL` = https://duckduckgo.com/bang.js y registro con Options cero (sin contacto de red en tests) |
 
 Ejecución: `go test ./internal/api/router/... ./internal/db/...` (solo
 stdlib + las deps del módulo).

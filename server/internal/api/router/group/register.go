@@ -51,36 +51,36 @@ type service struct {
 func Register(r *trpc.Router, database *db.DB, opts Options) {
 	s := &service{db: database, opts: &opts}
 
-	// group.getAll (group.ts:24-46).
+	// group.getAll (group.ts:24-46) (query).
 	r.Register("group.getAll", s.getAll)
-	// group.getPaginated (group.ts:48-82).
+	// group.getPaginated (group.ts:48-82) (query).
 	r.Register("group.getPaginated", s.getPaginated)
-	// group.getById (group.ts:83-131).
+	// group.getById (group.ts:83-131) (query).
 	r.Register("group.getById", s.getByID)
-	// group.selectable (group.ts:133-159).
+	// group.selectable (group.ts:133-159) (query).
 	r.Register("group.selectable", s.selectable)
-	// group.search (group.ts:160-177).
+	// group.search (group.ts:160-177) (query).
 	r.Register("group.search", s.search)
-	// group.createInitialExternalGroup (group.ts:178-223).
-	r.Register("group.createInitialExternalGroup", s.createInitialExternalGroup)
-	// group.createGroup (group.ts:224-241).
-	r.Register("group.createGroup", s.createGroup)
-	// group.updateGroup (group.ts:242-257).
-	r.Register("group.updateGroup", s.updateGroup)
-	// group.savePartialSettings (group.ts:258-271).
-	r.Register("group.savePartialSettings", s.savePartialSettings)
-	// group.savePositions (group.ts:272-294).
-	r.Register("group.savePositions", s.savePositions)
-	// group.savePermissions (group.ts:295-338).
-	r.Register("group.savePermissions", s.savePermissions)
-	// group.transferOwnership (group.ts:339-352).
-	r.Register("group.transferOwnership", s.transferOwnership)
-	// group.deleteGroup (group.ts:353-361).
-	r.Register("group.deleteGroup", s.deleteGroup)
-	// group.addMember (group.ts:362-392).
-	r.Register("group.addMember", s.addMember)
-	// group.removeMember (group.ts:393-404).
-	r.Register("group.removeMember", s.removeMember)
+	// group.createInitialExternalGroup (group.ts:178-223) (mutation).
+	r.Register("group.createInitialExternalGroup", admin.Writable(s.createInitialExternalGroup))
+	// group.createGroup (group.ts:224-241) (mutation).
+	r.Register("group.createGroup", admin.Writable(s.createGroup))
+	// group.updateGroup (group.ts:242-257) (mutation).
+	r.Register("group.updateGroup", admin.Writable(s.updateGroup))
+	// group.savePartialSettings (group.ts:258-271) (mutation).
+	r.Register("group.savePartialSettings", admin.Writable(s.savePartialSettings))
+	// group.savePositions (group.ts:272-294) (mutation).
+	r.Register("group.savePositions", admin.Writable(s.savePositions))
+	// group.savePermissions (group.ts:295-338) (mutation).
+	r.Register("group.savePermissions", admin.Writable(s.savePermissions))
+	// group.transferOwnership (group.ts:339-352) (mutation).
+	r.Register("group.transferOwnership", admin.Writable(s.transferOwnership))
+	// group.deleteGroup (group.ts:353-361) (mutation).
+	r.Register("group.deleteGroup", admin.Writable(s.deleteGroup))
+	// group.addMember (group.ts:362-392) (mutation).
+	r.Register("group.addMember", admin.Writable(s.addMember))
+	// group.removeMember (group.ts:393-404) (mutation).
+	r.Register("group.removeMember", admin.Writable(s.removeMember))
 }
 
 // --- output shapes -----------------------------------------------------------

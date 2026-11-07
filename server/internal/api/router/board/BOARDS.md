@@ -19,6 +19,7 @@ Fuentes citadas (todas en este repo):
 - **[perms-def]** `packages/definitions/src/permissions.ts` (groupPermissionParents, getPermissionsWithChildren), **[board-def]** `packages/definitions/src/board.ts`, **[section-def]** `packages/definitions/src/section.ts`, **[widget-def]** `packages/definitions/src/widget.ts`.
 - **[auth-board]** `packages/auth/permissions/board-permissions.ts` (constructBoardPermissions), **[auth-int]** `packages/auth/permissions/integration-permissions.ts`, **[auth-cb]** `packages/auth/callbacks.ts` (getCurrentUserPermissionsAsync).
 - **[schema]** `packages/db/schema/sqlite.ts`, **[seed]** `packages/db/migrations/seed.ts`.
+- **[common]** `packages/common/src/grid-algorithm.ts` + `packages/common/src/layout-resize-source.ts`.
 - **[int-access]** `packages/api/src/router/integration/integration-access.ts`.
 
 ## 1. Registro
@@ -31,7 +32,7 @@ board.Register(r, database, board.Options{})
 
 `Register` (register.go) registra los 4 routers con sus **paths punteados
 exactos** de [root] `packages/api/src/root.ts:8,12-14`: `board.*` (26
-procedimientos: 22 portados + 4 diferidos), `section.changeCollapsed`,
+procedimientos: 25 portados + 1 diferido), `section.changeCollapsed`,
 `app.*` (11: 10 portados + 1 diferido) y `userItemState.*` (2). Pánicos por
 path duplicado (los detecta `trpc.Router.Register`).
 
@@ -101,7 +102,7 @@ Con `board-view-all` en la sesión: sin filtro.
 | `board.catalog` | 640 | público | — | `[{id,name,logoImageUrl,permissions,isHome,isMobileHome}]` | ✅ port |
 | `board.search` | 643 | público | `{query, limit=10 (1-100)}` | ídem | ✅ port |
 | `board.createBoard` | 652 | `board-create` | `{name, columnCount(1-24), isPublic}` | `{boardId,name,layoutId}` | ✅ port |
-| `board.duplicateBoard` | 731 | `board-create` + view | `{id, name}` | `{boardId}` | ⏸ diferido (§6) |
+| `board.duplicateBoard` | 731 | `board-create` + view | `{id, name}` | `{boardId}` | ✅ port |
 | `board.renameBoard` | 1039 | full | `{id, name}` | `void` | ✅ port |
 | `board.changeBoardVisibility` | 1064 | full | `{id, visibility: public\|private}` | `void` | ✅ port |
 | `board.deleteBoard` | 1102 | full | `{id}` | `void` | ✅ port |
@@ -110,8 +111,8 @@ Con `board-view-all` en la sesión: sin filtro.
 | `board.getHomeBoard` | 1172 | público | — | full board (§4.3) | ✅ port |
 | `board.getBoardByName` | 1195 | view | `{name}` (nombre case-insensitive) | full board (§4.3) | ✅ port |
 | `board.getBoardSettings` | 1210 | modify | `{id}` | settings (§4.4) | ✅ port |
-| `board.saveLayouts` | 1269 | modify | `{id, layouts[]}` | `layouts[]` | ⏸ diferido (§6) |
-| `board.resetLayout` | 1555 | modify | `{boardId, layoutId}` | `void` | ⏸ diferido (§6) |
+| `board.saveLayouts` | 1269 | modify | `{id, layouts[]}` | `layouts[]` | ✅ port |
+| `board.resetLayout` | 1555 | modify | `{boardId, layoutId}` | `void` | ✅ port |
 | `board.savePartialBoardSettings` | 1636 | modify | `{id, ...settings parcial}` | `void` | ✅ port |
 | `board.saveBoard` | 1688 | modify | `{id, sections[], items[]}` (§4.5) | `void` | ✅ port¹ |
 | `board.getBoardPermissions` | 2123 | full | `{id}` | `{inherited,users,groups}` | ✅ port |
@@ -171,9 +172,8 @@ keys can still be updated."` (upsert sobre PK `user_id+item_id+key`). El
 gate `itemStateProcedure` ([uis] :12-20) devuelve `NOT_FOUND "Item not
 found"` / `NOT_FOUND "Board not found"`.
 
-**Totales: 40 procedimientos en el dominio — 35 portados, 5 diferidos**
-(`board.getManageOverview`, `board.duplicateBoard`, `board.saveLayouts`,
-`board.resetLayout`, `app.detectMetadata`).
+**Totales: 40 procedimientos en el dominio — 39 portados, 1 diferido**
+(`board.getManageOverview`, `app.detectMetadata`).
 
 ## 4. Formas de salida (lo que consume el frontend)
 
@@ -285,10 +285,12 @@ Las salidas `z.void()` llegan como `{"result":{"data":{}}}` (superjson de
    serverSetting `board` (`homeBoardId`/`mobileHomeBoardId`, defaults null).
 5. **Reparación de layouts protegidos**: `boardLayoutsNeedRepair`
    (board.ts:3062-3074) + `seedProtectedBoardLayoutsAsync` ([seed] seed.ts:98-190)
-   portados SIN la proyección de posiciones al layout mobile nuevo
-   (`insertMissingProjectedPositionsAsync` requiere el algoritmo de grid);
-   los layouts sembrados nacen vacíos. Solo afecta boards legacy
-   pre-migración 0029/0044.
+   portados completos, incluida la proyección de posiciones al layout mobile
+   (`insertMissingProjectedPositionsAsync`, seed.ts:209-303, sobre el
+   algoritmo de grid de grid.go). Solo afecta boards legacy pre-migración
+   0029/0044. Como upstream, la reparación corre en cada lectura de full
+   board y en `saveLayouts`/`resetLayout`; `duplicateBoard` NO repara
+   (usa la query relacional cruda de board.ts:756-773).
 6. **Permisos de integración** (`constructIntegrationPermissions`, [auth-int]):
    leídos de `integrationUserPermission`/`integrationGroupPermissions` +
    globales `integration-{use,interact,full}-all`.
@@ -305,14 +307,85 @@ Las salidas `z.void()` llegan como `{"result":{"data":{}}}` (superjson de
 | Procedimiento | Motivo |
 |---|---|
 | `board.getManageOverview` | Read-model de previsualización del panel de administración: agrega carriles/lanes, containers visibles e iconos de apps (~260 líneas); pura BD pero enorme y solo la usa esa página. |
-| `board.duplicateBoard` | Necesita `getUpdatedBoardLayout` → `generateResponsiveGridFor` (@homarr/common grid-algorithm) para proyectar posiciones al layout mobile generado. |
-| `board.saveLayouts` | Ídem (proyección al cambiar columnCount/gutters + `resizeSource`). |
-| `board.resetLayout` | Ídem (regenera el layout desde Base). |
 | `app.detectMetadata` | `fetchWebsiteMetadataAsync` (HTTP externo) + búsqueda de iconos; requiere el paquete icons/request-handler. |
 
-Al portarlos conviene extraer `generateResponsiveGridFor` a un paquete
-`internal/grid` con los tests de [board] `board/test/grid-algorithm.spec.ts`
-como oráculo.
+### 6.1 Algoritmo de grid responsivo (portado)
+
+`generateResponsiveGridFor` ([common] `packages/common/src/grid-algorithm.ts:23-138`)
+está portado en `grid.go` (del paquete `board`, no en un `internal/grid`
+separado: es el único consumidor y comparte los helpers de lanes de
+definitions.go). El oráculo es [board] `board/test/grid-algorithm.spec.ts`,
+portado completo en `grid_test.go` (5 fixtures de ítems 16→16/18/10/6/3
+columnas, 4 fixtures con containers anidados y el grafo recursivo
+corrupto). Quirks preservados deliberadamente:
+
+- Al ensanchar (`width >= previousWidth`) se conservan todos los offsets y
+  solo se recortan los widths a `min(columnCount, width)`; las secciones
+  anidadas SÍ se reproyectan antes del early-return (grid-algorithm.ts:61-81).
+- Al estrechar se empaqueta en orden `(yOffset, xOffset)` de las posiciones
+  originales (sort estable) y la altura de un container es
+  `max(alturaProyectada, alturaDeclarada)` (grid-algorithm.ts:87); en el
+  early-return, en cambio, la altura declarada gana.
+- `nextFreeSpot` escanea y<99999 y devuelve `null` → `Error "No free spot
+  available"` → 500; inalcanzable en la práctica porque `normalizeItems`
+  recorta todo width al column count (portado igualmente como
+  `errNoFreeSpot`).
+- El guard de ciclos `ancestorSectionIds` detiene grafos de secciones
+  recursivos corruptos (grid-algorithm.ts:50).
+
+Sobre el algoritmo vive `getUpdatedBoardLayout` (board.ts:2603-2715): remapea
+los carriles (roots left/main/right, carriles sin columnas → main), proyecta
+por carril con `previousWidth = MAX_SAFE_INTEGER` cuando varias lanes se
+fusionan, y produce las filas `item_layout`/`section_layout` más el
+`resizeSource` (`packages/common/src/layout-resize-source.ts`: el historial
+pre-resize solo se conserva mientras las posiciones proyectadas no se hayan
+tocado; al coincidir geometría y elementos se "rebobina" al arreglo original
+y una vuelta a la geometría original borra el historial).
+
+### 6.2 `board.saveLayouts` (board.ts:1269-1554)
+
+Entrada `{id, layouts[]}` (responsiveBoardLayoutsSchema: mínimo 2, exactamente
+un Mobile y un Base, breakpoints/ids únicos, gutters 0-3 que dejan ≥1 columna,
+Mobile sin sidebars — los mensajes exactos de los `superRefine` se replican).
+Permiso modify. Efectos en orden: `ensureGutterRootSectionsAsync` crea los
+roots de carril left/right que falten (múltiples roots = Error → 500); la
+validación de roles (`New layouts must use the custom role` / `Mobile and
+Base layouts cannot be removed` / `Layout roles cannot be changed` — las dos
+últimas inalcanzables por el esquema, portadas igualmente); el Base se
+proyecta una vez si cambian columnCount/gutters y los layouts custom nuevos
+se proyectan EN CADENA desde el Base ya redimensionado
+(`getElementsForProjectedLayout`); los layouts redimensionados actualizan sus
+`item_layout`/`section_layout` por `(itemId|sectionId, layoutId)` y guardan
+el `resizeSource`; los layouts custom eliminados se borran (sin cascade).
+Salida: los layouts enviados con ids generados para los añadidos, roles de BD
+y ordenados por breakpoint.
+
+### 6.3 `board.resetLayout` (board.ts:1555-1635)
+
+Entrada `{boardId, layoutId}`. Permiso modify. Errores: `NOT_FOUND "Layout
+not found"`, `INTERNAL_SERVER_ERROR "Board must have a Base layout"`,
+`BAD_REQUEST "The Base layout cannot be reset"`. Proyecta Base → layout
+objetivo (`getUpdatedBoardLayout`) y en una transacción: `resize_source =
+NULL` del objetivo, borrado de sus `item_layout`/`section_layout` e inserción
+de las filas proyectadas. Los items sin colocación en Base pierden su
+colocación en el objetivo (semántica upstream). Salida `void`.
+
+### 6.4 `board.duplicateBoard` (board.ts:731-1038)
+
+Entrada `{id, name}` (boardNameSchema). Gates en orden: `board-create`
+(FORBIDDEN "Permission denied"), view del board (NOT_FOUND anti-snooping),
+`noBoardWithSimilarNameAsync` (CONFLICT "Board with similar name already
+exists", case-insensitive). Carga cruda (sin reparación de layouts);
+`throwIfCustomWidgetBoardDuplicationForbidden` (FORBIDDEN si hay
+`kind=customApi` sin admin) y `validateWidgetConfigurationsAsync` (todas las
+integraciones deben existir y dar `use`). Clona en una transacción: board
+(todas las columnas, name=input, creatorId=caller), layouts normalizados
+(`normalizeBoardLayoutRoles` para ≥2; con 1 layout genera Mobile(3, bp0) y
+convierte el existente en Base(768) proyectando sus posiciones al mobile con
+`getUpdatedBoardLayout`; con 0 genera el par Mobile/Base), sections,
+section_layout (+ proyección), section_collapse_state (mismo usuario, nueva
+section), items, item_layout (+ proyección) e integration_item — todos con
+ids nuevos, `resizeSource` NULL. Salida `{boardId}`.
 
 ## 7. Repositories nuevos en internal/db
 
@@ -352,3 +425,13 @@ sesión por header (equivalente del middleware auth). Tests:
 | `TestGetHomeBoardFallbacks` | cadena de home board (serverSettings → user) |
 | `TestGetBoardsForGroup` | gate admin + boards del grupo |
 | `TestAppRouter` | gates por permiso, formas de App, AppAccessControl anónimo (público/privado), search, getPaginated, selectable, update, delete, createMany con fallback de icono |
+| `TestGridAlgorithmItemFixtures` | oráculo [board] grid-algorithm.spec.ts: 5 fixtures de texto 16→16/18/10/6/3 columnas |
+| `TestGridAlgorithmContainerFixtures` | oráculo: 4 fixtures con containers anidados (outer "b", inner "f") |
+| `TestGridAlgorithmStopsRecursiveSectionGraph` | oráculo: grafo recursivo corrupto |
+| `TestGridAlgorithmWideningKeepsOffsetsAndClampsWidth`, `TestGridAlgorithmNarrowingPacksInScanOrder`, `TestGridAlgorithmNestedContainerReflowsWhileRootWidens`, `TestGridAlgorithmPackingUsesProjectedSectionHeight`, `TestGridAlgorithmEmptySection` | quirks extra del algoritmo (grid_test.go) |
+| `TestSaveLayoutsRoundtrip` | saveLayouts: guards UNAUTHORIZED/NOT_FOUND, mensajes exactos de validación, ensanche con resizeSource, rebobinado al volver a la geometría original, alta/baja de layout custom con proyección |
+| `TestSaveLayoutsNarrowingProjectsPlacements` | empaquetado del estrechamiento a través del procedimiento |
+| `TestResetLayoutRestoresFromBase` | resetLayout: guards ("Layout not found", "The Base layout cannot be reset"), proyección Base→Mobile, Base intacto, resizeSource NULL |
+| `TestDuplicateBoardClonesBoard` | duplicateBoard: gates (UNAUTHORIZED/FORBIDDEN/NOT_FOUND/CONFLICT/nombre inválido), clon completo con ids nuevos (board, layouts, sections, placements, items, integrations, collapse states), original intacto |
+| `TestDuplicateBoardSingleLayoutGeneratesMobile` | ruta legacy de 1 layout: Mobile generado con la proyección Base→3 columnas |
+| `TestDuplicateBoardCustomWidgetGuard` | FORBIDDEN con Custom Widget sin admin; admin sí duplica |

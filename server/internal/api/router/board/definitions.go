@@ -125,6 +125,10 @@ const (
 	laneRight = "right"
 )
 
+// boardLanes mirrors boardLanes (packages/definitions/src/section.ts:6): the
+// fixed left → main → right iteration order of the lane math.
+var boardLanes = []string{laneLeft, laneMain, laneRight}
+
 const (
 	rootSectionOffsetLeft  = -1
 	rootSectionOffsetMain  = 0

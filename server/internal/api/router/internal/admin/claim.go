@@ -2,13 +2,17 @@ package admin
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/ydtoloza/homarr/server/internal/db"
@@ -111,4 +115,165 @@ func OnboardingAccessAllowed(ctx context.Context, database *db.DB, c Caller, cla
 		return false, nil
 	}
 	return IsOnboardingClaimValid(ctx, database, claimToken, time.Now())
+}
+
+// --- claim issuance (claimOnboardingAsync, onboarding-claim.ts:78-117) -------
+
+// OnboardingClaimTTL is onboardingClaimTtlMs (onboarding-claim.ts:9): claims
+// live for four hours.
+const OnboardingClaimTTL = 4 * time.Hour
+
+// Claim statuses, the ClaimOnboardingResult union (onboarding-claim.ts:16-19).
+const (
+	ClaimStatusIssued    = "issued"
+	ClaimStatusActive    = "active"
+	ClaimStatusLocked    = "locked"
+	ClaimStatusFinished  = "finished"
+	ClaimStatusForbidden = "forbidden"
+)
+
+// ClaimOnboardingOptions carries the request-time knobs of
+// claimOnboardingAsync (onboarding-claim.ts:80): the token the caller already
+// holds (from the claim cookie), the administrator override, and the test
+// seams Now/TTL (upstream options.now / options.ttlMs; zero values mean
+// time.Now() and the four-hour default).
+type ClaimOnboardingOptions struct {
+	CurrentToken string
+	Force        bool
+	Now          time.Time
+	TTL          time.Duration
+}
+
+// ClaimOnboardingResult is ClaimOnboardingResult (onboarding-claim.ts:16-19):
+// issued/active carry the token and expiry; locked carries the expiry;
+// finished/forbidden carry nothing.
+type ClaimOnboardingResult struct {
+	Status    string
+	Token     string
+	ExpiresAt int64 // epoch milliseconds
+}
+
+// ClaimOnboarding is claimOnboardingAsync (onboarding-claim.ts:78-117), the
+// issuance side of the first-run wizard claim consumed by the REST endpoint
+// POST /api/onboarding/claim (onboard.ClaimHandler):
+//
+//   - the wizard being finished wins over everything (status "finished");
+//   - once any user exists, minting requires the administrator override
+//     (status "forbidden");
+//   - the caller's own unexpired claim is "active" (idempotent re-claim);
+//   - someone else's unexpired claim locks minting (status "locked");
+//   - otherwise the previous row is deleted only while it still holds the
+//     value that was read (optimistic lock, db.DeleteServerSettingIfValue)
+//     and a fresh token (32 random bytes, base64url) is stored as
+//     {"hash": sha256hex(token), "expiresAt": epochMs} for the TTL. If the
+//     insert loses a race (the PK is already taken again), the winner row is
+//     re-read: an unexpired winner answers "locked", any other insert error
+//     propagates.
+func ClaimOnboarding(ctx context.Context, database *db.DB, opts ClaimOnboardingOptions) (ClaimOnboardingResult, error) {
+	// onboarding?.step === "finish" checks the RAW step (no normalization).
+	row, err := database.GetOnboardingRow(ctx)
+	if err != nil && !errors.Is(err, db.ErrNotFound) {
+		return ClaimOnboardingResult{}, fmt.Errorf("admin: read onboarding row: %w", err)
+	}
+	if err == nil && row.Step == OnboardingStepFinish {
+		return ClaimOnboardingResult{Status: ClaimStatusFinished}, nil
+	}
+
+	hasUser, err := database.HasAnyUser(ctx)
+	if err != nil {
+		return ClaimOnboardingResult{}, fmt.Errorf("admin: check users for claim: %w", err)
+	}
+	if hasUser && !opts.Force {
+		return ClaimOnboardingResult{Status: ClaimStatusForbidden}, nil
+	}
+
+	now := opts.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
+	ttl := opts.TTL
+	if ttl <= 0 {
+		ttl = OnboardingClaimTTL
+	}
+
+	setting, err := database.GetServerSetting(ctx, OnboardingClaimSettingKey)
+	currentClaim := (*storedClaim)(nil)
+	currentRowExists := false
+	switch {
+	case errors.Is(err, db.ErrNotFound):
+		// no current row
+	case err != nil:
+		return ClaimOnboardingResult{}, fmt.Errorf("admin: read onboarding claim: %w", err)
+	default:
+		currentRowExists = true
+		currentClaim = parseStoredClaim(setting.Value)
+	}
+
+	if currentClaim != nil && opts.CurrentToken != "" && tokenMatches(*currentClaim, opts.CurrentToken, now) {
+		return ClaimOnboardingResult{Status: ClaimStatusActive, Token: opts.CurrentToken, ExpiresAt: currentClaim.ExpiresAt}, nil
+	}
+	if currentClaim != nil && currentClaim.ExpiresAt > now.UnixMilli() && !opts.Force {
+		return ClaimOnboardingResult{Status: ClaimStatusLocked, ExpiresAt: currentClaim.ExpiresAt}, nil
+	}
+
+	if currentRowExists {
+		// Delete only the exact row that was read (onboarding-claim.ts:97-101).
+		if err := database.DeleteServerSettingIfValue(ctx, OnboardingClaimSettingKey, setting.Value); err != nil {
+			return ClaimOnboardingResult{}, fmt.Errorf("admin: rotate onboarding claim: %w", err)
+		}
+	}
+
+	tokenBytes := make([]byte, 32) // randomBytes(32).toString("base64url")
+	if _, err := rand.Read(tokenBytes); err != nil {
+		return ClaimOnboardingResult{}, fmt.Errorf("admin: generate onboarding claim token: %w", err)
+	}
+	token := base64.RawURLEncoding.EncodeToString(tokenBytes)
+	expiresAt := now.Add(ttl)
+	value, err := json.Marshal(storedClaim{Hash: hashToken(token), ExpiresAt: expiresAt.UnixMilli()})
+	if err != nil {
+		return ClaimOnboardingResult{}, fmt.Errorf("admin: encode onboarding claim: %w", err)
+	}
+	if err := database.InsertServerSetting(ctx, OnboardingClaimSettingKey, string(value)); err != nil {
+		// The insert only fails while another minter won the PK; re-read the
+		// winner (onboarding-claim.ts:108-115).
+		winner, winnerErr := database.GetServerSetting(ctx, OnboardingClaimSettingKey)
+		if winnerErr == nil {
+			if winnerClaim := parseStoredClaim(winner.Value); winnerClaim != nil && winnerClaim.ExpiresAt > now.UnixMilli() {
+				return ClaimOnboardingResult{Status: ClaimStatusLocked, ExpiresAt: winnerClaim.ExpiresAt}, nil
+			}
+		}
+		return ClaimOnboardingResult{}, fmt.Errorf("admin: store onboarding claim: %w", err)
+	}
+	return ClaimOnboardingResult{Status: ClaimStatusIssued, Token: token, ExpiresAt: expiresAt.UnixMilli()}, nil
+}
+
+// OnboardingClaimTokenFromCookieHeader is
+// getOnboardingClaimTokenFromCookieHeader (onboarding-claim.ts:44-60): scan
+// the raw Cookie header for the claim cookie and percent-decode its value.
+// A missing header, a value-less match, a malformed escape or a similar
+// name ("...-copy") all yield "" (upstream: undefined).
+func OnboardingClaimTokenFromCookieHeader(cookieHeader string) string {
+	if cookieHeader == "" {
+		return ""
+	}
+	for _, part := range strings.Split(cookieHeader, ";") {
+		separator := strings.IndexByte(part, '=')
+		if separator < 0 {
+			continue
+		}
+		if strings.TrimSpace(part[:separator]) != OnboardingClaimCookieName {
+			continue
+		}
+		value := strings.TrimSpace(part[separator+1:])
+		if value == "" {
+			return ""
+		}
+		// decodeURIComponent: percent-decoding without "+"-as-space.
+		decoded, err := url.PathUnescape(value)
+		if err != nil {
+			return ""
+		}
+		return decoded
+	}
+	return ""
 }

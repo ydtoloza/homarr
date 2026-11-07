@@ -35,24 +35,25 @@ var jsonNull = json.RawMessage("null")
 // Register registers the searchEngine router under its upstream paths.
 func Register(r *trpc.Router, database *db.DB, _ Options) {
 	s := &service{db: database}
-	// searchEngine.getPaginated (search-engine-router.ts:17-31).
+	// searchEngine.getPaginated (search-engine-router.ts:17-31) (query).
 	r.Register("searchEngine.getPaginated", s.getPaginated)
-	// searchEngine.getSelectable (search-engine-router.ts:32-45).
+	// searchEngine.getSelectable (search-engine-router.ts:32-45) (query).
 	r.Register("searchEngine.getSelectable", s.getSelectable)
-	// searchEngine.byId (search-engine-router.ts:47-72).
+	// searchEngine.byId (search-engine-router.ts:47-72) (query).
 	r.Register("searchEngine.byId", s.byId)
-	// searchEngine.getDefaultSearchEngine (search-engine-router.ts:73-135).
+	// searchEngine.getDefaultSearchEngine (search-engine-router.ts:73-135)
+	// (query).
 	r.Register("searchEngine.getDefaultSearchEngine", s.getDefaultSearchEngine)
-	// searchEngine.catalog (search-engine-router.ts:136-157).
+	// searchEngine.catalog (search-engine-router.ts:136-157) (query).
 	r.Register("searchEngine.catalog", s.catalog)
-	// searchEngine.search (search-engine-router.ts:158-178).
+	// searchEngine.search (search-engine-router.ts:158-178) (query).
 	r.Register("searchEngine.search", s.search)
-	// searchEngine.create (search-engine-router.ts:179-193).
-	r.Register("searchEngine.create", s.create)
-	// searchEngine.update (search-engine-router.ts:194-220).
-	r.Register("searchEngine.update", s.update)
-	// searchEngine.delete (search-engine-router.ts:221-232).
-	r.Register("searchEngine.delete", s.delete)
+	// searchEngine.create (search-engine-router.ts:179-193) (mutation).
+	r.Register("searchEngine.create", admin.Writable(s.create))
+	// searchEngine.update (search-engine-router.ts:194-220) (mutation).
+	r.Register("searchEngine.update", admin.Writable(s.update))
+	// searchEngine.delete (search-engine-router.ts:221-232) (mutation).
+	r.Register("searchEngine.delete", admin.Writable(s.delete))
 }
 
 // --- output shapes -----------------------------------------------------------

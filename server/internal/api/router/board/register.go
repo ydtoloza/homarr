@@ -21,6 +21,7 @@ package board
 import (
 	"context"
 
+	"github.com/ydtoloza/homarr/server/internal/api/router/internal/admin"
 	"github.com/ydtoloza/homarr/server/internal/api/trpc"
 	"github.com/ydtoloza/homarr/server/internal/db"
 )
@@ -72,9 +73,9 @@ func Register(r *trpc.Router, database *db.DB, opts Options) {
 }
 
 // registerBoardRouter mirrors boardRouter (packages/api/src/router/board.ts:265).
-// Deferred procedures are documented in BOARDS.md: board.getManageOverview,
-// board.duplicateBoard, board.saveLayouts and board.resetLayout (they need
-// the responsive grid projection algorithm of @homarr/common).
+// The only deferred procedure is board.getManageOverview (BOARDS.md section 6).
+// Mutations are wrapped with admin.Writable (the upstream credentialProcedure
+// base middleware, packages/api/src/trpc.ts:130-135).
 func registerBoardRouter(r *trpc.Router, s *service) {
 	r.Register("board.exists", s.boardExists)
 	r.Register("board.getPublicBoards", s.boardGetPublicBoards)
@@ -82,27 +83,30 @@ func registerBoardRouter(r *trpc.Router, s *service) {
 	r.Register("board.getAllBoards", s.boardGetAllBoards)
 	r.Register("board.catalog", s.boardCatalog)
 	r.Register("board.search", s.boardSearch)
-	r.Register("board.createBoard", s.boardCreateBoard)
-	r.Register("board.renameBoard", s.boardRenameBoard)
-	r.Register("board.changeBoardVisibility", s.boardChangeBoardVisibility)
-	r.Register("board.deleteBoard", s.boardDeleteBoard)
-	r.Register("board.setHomeBoard", s.boardSetHomeBoard)
-	r.Register("board.setMobileHomeBoard", s.boardSetMobileHomeBoard)
+	r.Register("board.createBoard", admin.Writable(s.boardCreateBoard))
+	r.Register("board.duplicateBoard", admin.Writable(s.boardDuplicateBoard))
+	r.Register("board.renameBoard", admin.Writable(s.boardRenameBoard))
+	r.Register("board.changeBoardVisibility", admin.Writable(s.boardChangeBoardVisibility))
+	r.Register("board.deleteBoard", admin.Writable(s.boardDeleteBoard))
+	r.Register("board.setHomeBoard", admin.Writable(s.boardSetHomeBoard))
+	r.Register("board.setMobileHomeBoard", admin.Writable(s.boardSetMobileHomeBoard))
 	r.Register("board.getHomeBoard", s.boardGetHomeBoard)
 	r.Register("board.getBoardByName", s.boardGetBoardByName)
 	r.Register("board.getBoardSettings", s.boardGetBoardSettings)
-	r.Register("board.savePartialBoardSettings", s.boardSavePartialBoardSettings)
-	r.Register("board.saveBoard", s.boardSaveBoard)
+	r.Register("board.saveLayouts", admin.Writable(s.boardSaveLayouts))
+	r.Register("board.resetLayout", admin.Writable(s.boardResetLayout))
+	r.Register("board.savePartialBoardSettings", admin.Writable(s.boardSavePartialBoardSettings))
+	r.Register("board.saveBoard", admin.Writable(s.boardSaveBoard))
 	r.Register("board.getBoardPermissions", s.boardGetBoardPermissions)
-	r.Register("board.saveUserBoardPermissions", s.boardSaveUserBoardPermissions)
-	r.Register("board.saveGroupBoardPermissions", s.boardSaveGroupBoardPermissions)
-	r.Register("board.addItem", s.boardAddItem)
-	r.Register("board.updateItemLayout", s.boardUpdateItemLayout)
+	r.Register("board.saveUserBoardPermissions", admin.Writable(s.boardSaveUserBoardPermissions))
+	r.Register("board.saveGroupBoardPermissions", admin.Writable(s.boardSaveGroupBoardPermissions))
+	r.Register("board.addItem", admin.Writable(s.boardAddItem))
+	r.Register("board.updateItemLayout", admin.Writable(s.boardUpdateItemLayout))
 }
 
 // registerSectionRouter mirrors sectionRouter (section-router.ts:12-72).
 func registerSectionRouter(r *trpc.Router, s *service) {
-	r.Register("section.changeCollapsed", s.sectionChangeCollapsed)
+	r.Register("section.changeCollapsed", admin.Writable(s.sectionChangeCollapsed))
 }
 
 // registerAppRouter mirrors appRouter (packages/api/src/router/app.ts:23-330).
@@ -114,15 +118,15 @@ func registerAppRouter(r *trpc.Router, s *service) {
 	r.Register("app.selectable", s.appSelectable)
 	r.Register("app.byId", s.appByID)
 	r.Register("app.byIds", s.appByIDs)
-	r.Register("app.create", s.appCreate)
-	r.Register("app.createMany", s.appCreateMany)
-	r.Register("app.update", s.appUpdate)
-	r.Register("app.delete", s.appDelete)
+	r.Register("app.create", admin.Writable(s.appCreate))
+	r.Register("app.createMany", admin.Writable(s.appCreateMany))
+	r.Register("app.update", admin.Writable(s.appUpdate))
+	r.Register("app.delete", admin.Writable(s.appDelete))
 }
 
 // registerUserItemStateRouter mirrors userItemStateRouter
 // (packages/api/src/router/user-item-state.ts:22-76).
 func registerUserItemStateRouter(r *trpc.Router, s *service) {
 	r.Register("userItemState.get", s.userItemStateGet)
-	r.Register("userItemState.set", s.userItemStateSet)
+	r.Register("userItemState.set", admin.Writable(s.userItemStateSet))
 }

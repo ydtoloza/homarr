@@ -2,6 +2,7 @@ package board
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"reflect"
 
@@ -1560,4 +1561,323 @@ func doBoardItemPlacementsOverlap(left, right placementRect) bool {
 		left.yOffset+left.height > right.yOffset &&
 		left.xOffset < right.xOffset+right.width &&
 		left.xOffset+left.width > right.xOffset
+}
+
+// --- duplicateBoard ------------------------------------------------------------
+
+// boolToInt renders a boolean as the SQLite 0/1 integer column value.
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// boardDuplicateBoard is board.duplicateBoard (board.ts:731-1038): clones the
+// board with fresh ids, normalizing its layouts and projecting the source
+// placements onto a generated Mobile layout when the source has only one.
+func (s *service) boardDuplicateBoard(ctx context.Context, input json.RawMessage) (any, *trpc.Error) {
+	c, terr := s.resolveCaller(ctx)
+	if terr != nil {
+		return nil, terr
+	}
+	// permissionRequiredProcedure.requiresPermission("board-create")
+	// (board.ts:731-732): signed in, then FORBIDDEN "Permission denied".
+	if terr := requirePermission(c, "board-create"); terr != nil {
+		return nil, terr
+	}
+	dec, terr := newInputDecoder(input)
+	if terr != nil {
+		return nil, terr
+	}
+	id, terr := dec.str("id")
+	if terr != nil {
+		return nil, terr
+	}
+	name, terr := dec.str("name")
+	if terr != nil {
+		return nil, terr
+	}
+	if !isBoardName(name) {
+		return nil, badRequestf("invalid board name")
+	}
+	// throwIfActionForbiddenAsync(..., "view") before anything else
+	// (board.ts:753).
+	if terr := s.requireBoardAccess(ctx, id, c, permView); terr != nil {
+		return nil, terr
+	}
+	// noBoardWithSimilarNameAsync (board.ts:754).
+	taken, err := s.db.BoardNameTaken(ctx, name, nil)
+	if err != nil {
+		return nil, internalError(err)
+	}
+	if taken {
+		return nil, trpc.NewError(trpc.CodeConflict, "Board with similar name already exists")
+	}
+
+	// The relational query of board.ts:756-773: layouts, sections (with
+	// collapse states and layouts) and items (with layouts and integrations).
+	// Unlike the full-board reads this path does not repair protected layouts.
+	board, err := s.db.GetBoardFullByID(ctx, id)
+	if err != nil {
+		return nil, notFoundBoard()
+	}
+	layoutRows, err := s.db.ListLayoutsByBoard(ctx, id)
+	if err != nil {
+		return nil, internalError(err)
+	}
+	sectionRows, err := s.db.ListSectionsByBoard(ctx, id)
+	if err != nil {
+		return nil, internalError(err)
+	}
+	sectionLayoutRows, err := s.db.ListSectionLayoutsByBoard(ctx, id)
+	if err != nil {
+		return nil, internalError(err)
+	}
+	itemRows, err := s.db.ListItemsByBoard(ctx, id)
+	if err != nil {
+		return nil, internalError(err)
+	}
+	itemLayoutRows, err := s.db.ListItemLayoutsByBoard(ctx, id)
+	if err != nil {
+		return nil, internalError(err)
+	}
+	integrationRows, err := s.db.ListIntegrationItemsByBoard(ctx, id)
+	if err != nil {
+		return nil, internalError(err)
+	}
+
+	// throwIfCustomWidgetBoardDuplicationForbidden (board.ts:783): any
+	// Custom Widget requires the admin permission.
+	for _, item := range itemRows {
+		if item.Kind == "customApi" && !c.isAdmin() {
+			return nil, customWidgetForbidden()
+		}
+	}
+	// validateWidgetConfigurationsAsync (board.ts:784-791) without stored
+	// items: every integration of every item must exist and grant "use".
+	widgets := make([]widgetConfig, 0, len(itemRows))
+	for _, item := range itemRows {
+		integrationIDs := make([]string, 0)
+		for _, rel := range integrationRows {
+			if rel.ItemID == item.ID {
+				integrationIDs = append(integrationIDs, rel.IntegrationID)
+			}
+		}
+		widgets = append(widgets, widgetConfig{ID: item.ID, Kind: item.Kind, IntegrationIDs: integrationIDs})
+	}
+	if terr := s.validateWidgetConfigurations(ctx, c, widgets, nil); terr != nil {
+		return nil, terr
+	}
+
+	newBoardID := createID()
+	generatedMobileLayoutID := createID()
+
+	// Layout normalization and the projection onto the generated Mobile
+	// layout (board.ts:795-851).
+	var generatedPositions *updatedBoardLayout
+	var normalizedLayouts []db.Layout
+	switch {
+	case len(layoutRows) == 0:
+		normalizedLayouts = []db.Layout{
+			{ID: generatedMobileLayoutID, Name: "Mobile", BoardID: id, ColumnCount: 3,
+				Breakpoint: 0, Role: "mobile"},
+			{ID: createID(), Name: "Base", BoardID: id, ColumnCount: 10,
+				Breakpoint: 768, Role: "base"},
+		}
+	case len(layoutRows) == 1:
+		projectionBoard := newBoardForLayoutProjection(id, layoutRows, sectionRows, sectionLayoutRows, itemRows, itemLayoutRows)
+		positions, err := getUpdatedBoardLayout(projectionBoard, updatedLayoutOptions{
+			PreviousGeometry: layoutGeometryValueOf(layoutRows[0]),
+			CurrentGeometry: layoutGeometryValue{
+				LayoutID: generatedMobileLayoutID, ColumnCount: 3,
+			},
+		})
+		if err != nil {
+			return nil, internalError(err)
+		}
+		generatedPositions = &positions
+		base := layoutRows[0]
+		base.Breakpoint, base.Role = 768, "base"
+		normalizedLayouts = []db.Layout{
+			{ID: generatedMobileLayoutID, Name: "Mobile", BoardID: id, ColumnCount: 3,
+				Breakpoint: 0, Role: "mobile"},
+			base,
+		}
+	default:
+		normalizedLayouts = nil
+		for _, layout := range normalizeBoardLayoutRoles(layoutRows) {
+			normalizedLayouts = append(normalizedLayouts, layout.Layout)
+		}
+	}
+
+	// The new ids (board.ts:852-911).
+	layoutIDs := map[string]string{}
+	for _, layout := range normalizedLayouts {
+		layoutIDs[layout.ID] = createID()
+	}
+	sectionIDs := map[string]string{}
+	for _, sec := range sectionRows {
+		sectionIDs[sec.ID] = createID()
+	}
+	itemIDs := map[string]string{}
+	for _, item := range itemRows {
+		itemIDs[item.ID] = createID()
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, internalError(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// The board row keeps every column of the source except name (the input)
+	// and creatorId (the caller), board.ts:958-963/998-1003.
+	if _, err := tx.ExecContext(ctx, `INSERT INTO "board" (id, name, is_public, creator_id, page_title,
+		meta_title, logo_image_url, favicon_image_url, background_image_url, background_image_attachment,
+		background_image_repeat, background_image_size, primary_color, secondary_color, opacity,
+		custom_css, icon_color, item_radius, disable_status)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		newBoardID, name, boolToInt(board.IsPublic), c.session.UserID,
+		nullableStr(board.PageTitle), nullableStr(board.MetaTitle),
+		nullableStr(board.LogoImageUrl), nullableStr(board.FaviconImageUrl),
+		nullableStr(board.BackgroundImageUrl),
+		board.BackgroundImageAttachment, board.BackgroundImageRepeat, board.BackgroundImageSize,
+		board.PrimaryColor, board.SecondaryColor, board.Opacity,
+		nullableStr(board.CustomCss), nullableStr(board.IconColor), board.ItemRadius,
+		boolToInt(board.DisableStatus)); err != nil {
+		return nil, internalError(err)
+	}
+
+	for _, layout := range normalizedLayouts {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO "layout" (id, name, board_id, column_count,
+			left_gutter_column_count, right_gutter_column_count, breakpoint, role, resize_source)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+			layoutIDs[layout.ID], layout.Name, newBoardID, layout.ColumnCount,
+			layout.LeftGutterColumnCount, layout.RightGutterColumnCount,
+			layout.Breakpoint, layout.Role); err != nil {
+			return nil, internalError(err)
+		}
+	}
+	for _, sec := range sectionRows {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO "section" (id, board_id, kind, x_offset, y_offset, name, options)
+			VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			sectionIDs[sec.ID], newBoardID, sec.Kind, sec.XOffset, sec.YOffset, sec.Name, sec.Options); err != nil {
+			return nil, internalError(err)
+		}
+	}
+	// Container placements of the stored layouts plus the projected
+	// placements of the generated Mobile layout (board.ts:871-899). Parents
+	// are remapped through the section map; an unmapped (orphaned) parent
+	// becomes NULL like the undefined of sectionMap.get(...).
+	for _, sl := range sectionLayoutRows {
+		if _, ok := sectionIDs[sl.SectionID]; !ok {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO "section_layout" (section_id, layout_id, parent_section_id,
+			x_offset, y_offset, width, height) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			sectionIDs[sl.SectionID], layoutIDs[sl.LayoutID], nullableStr(sectionIDs[sl.ParentSectionID]),
+			sl.XOffset, sl.YOffset, sl.Width, sl.Height); err != nil {
+			return nil, internalError(err)
+		}
+	}
+	if generatedPositions != nil {
+		for _, row := range generatedPositions.SectionLayouts {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO "section_layout" (section_id, layout_id, parent_section_id,
+				x_offset, y_offset, width, height) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+				sectionIDs[row.SectionID], layoutIDs[row.LayoutID], nullableStr(sectionIDs[row.ParentSectionID]),
+				row.XOffset, row.YOffset, row.Width, row.Height); err != nil {
+				return nil, internalError(err)
+			}
+		}
+	}
+	// Per-user collapse states keep their user and follow the new section id
+	// (board.ts:900-909).
+	if err := s.insertDuplicatedCollapseStates(ctx, tx, id, sectionIDs); err != nil {
+		return nil, err
+	}
+	for _, item := range itemRows {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO "item" (id, board_id, kind, options, advanced_options)
+			VALUES (?, ?, ?, ?, ?)`,
+			itemIDs[item.ID], newBoardID, item.Kind, item.Options, item.AdvancedOptions); err != nil {
+			return nil, internalError(err)
+		}
+	}
+	for _, il := range itemLayoutRows {
+		if _, ok := itemIDs[il.ItemID]; !ok {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO "item_layout" (item_id, section_id, layout_id,
+			x_offset, y_offset, width, height) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			itemIDs[il.ItemID], sectionIDs[il.SectionID], layoutIDs[il.LayoutID],
+			il.XOffset, il.YOffset, il.Width, il.Height); err != nil {
+			return nil, internalError(err)
+		}
+	}
+	if generatedPositions != nil {
+		for _, row := range generatedPositions.ItemSectionLayouts {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO "item_layout" (item_id, section_id, layout_id,
+				x_offset, y_offset, width, height) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+				itemIDs[row.ItemID], sectionIDs[row.SectionID], layoutIDs[row.LayoutID],
+				row.XOffset, row.YOffset, row.Width, row.Height); err != nil {
+				return nil, internalError(err)
+			}
+		}
+	}
+	for _, rel := range integrationRows {
+		if _, ok := itemIDs[rel.ItemID]; !ok {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO "integration_item" (item_id, integration_id) VALUES (?, ?)`,
+			itemIDs[rel.ItemID], rel.IntegrationID); err != nil {
+			return nil, internalError(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, internalError(err)
+	}
+	return map[string]any{"boardId": newBoardID}, nil
+}
+
+// insertDuplicatedCollapseStates copies the section_collapse_state rows of
+// the source board onto the duplicated sections (the collapseStates relation
+// of board.ts:761-763, inserted at board.ts:900-909/1018-1020).
+func (s *service) insertDuplicatedCollapseStates(ctx context.Context, tx *sql.Tx, boardID string, sectionIDs map[string]string) *trpc.Error {
+	rows, err := tx.QueryContext(ctx, `SELECT sc.section_id, sc.user_id, sc.collapsed
+		FROM "section_collapse_state" sc
+		JOIN "section" s ON s.id = sc.section_id
+		WHERE s.board_id = ?`, boardID)
+	if err != nil {
+		return internalError(err)
+	}
+	type collapseRow struct {
+		sectionID string
+		userID    string
+		collapsed int
+	}
+	var states []collapseRow
+	for rows.Next() {
+		var row collapseRow
+		if err := rows.Scan(&row.sectionID, &row.userID, &row.collapsed); err != nil {
+			_ = rows.Close()
+			return internalError(err)
+		}
+		states = append(states, row)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return internalError(err)
+	}
+	rows.Close()
+	for _, state := range states {
+		newSectionID, ok := sectionIDs[state.sectionID]
+		if !ok {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO "section_collapse_state" (section_id, user_id, collapsed)
+			VALUES (?, ?, ?)`, newSectionID, state.userID, state.collapsed); err != nil {
+			return internalError(err)
+		}
+	}
+	return nil
 }

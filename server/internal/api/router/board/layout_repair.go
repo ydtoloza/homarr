@@ -34,14 +34,14 @@ func boardLayoutsNeedRepair(layouts []db.Layout) bool {
 	return mobileCount != 1 || baseCount != 1 || mobileBreakpoint != 0 || len(seenBreakpoints) != len(layouts)
 }
 
-// repairProtectedLayouts seeds the missing protected layouts. The upstream
-// projections of item/section positions onto the new mobile layout
-// (insertMissingProjectedPositionsAsync, seed.ts:181+) rely on the
-// responsive grid algorithm of @homarr/common and are deferred; newly seeded
-// layouts start empty, like a fresh board.
+// repairProtectedLayouts seeds the missing protected layouts and projects the
+// item/section positions of the Base layout onto the (new) Mobile layout
+// with insertMissingProjectedPositionsAsync
+// (packages/db/migrations/seed.ts:98-190).
 func (s *service) repairProtectedLayouts(ctx context.Context, boardID string, layouts []db.Layout) *trpc.Error {
 	if len(layouts) == 0 {
-		// seed.ts:109-129: insert the Mobile + Base pair.
+		// seed.ts:109-129: insert the Mobile + Base pair; the fresh pair does
+		// not project positions (continue in seed.ts:128).
 		if err := s.db.InsertLayout(ctx, db.Layout{
 			ID: createID(), Name: "Mobile", BoardID: boardID, ColumnCount: 3, Breakpoint: 0, Role: "mobile",
 		}); err != nil {
@@ -55,21 +55,25 @@ func (s *service) repairProtectedLayouts(ctx context.Context, boardID string, la
 		return nil
 	}
 	if len(layouts) == 1 {
-		// seed.ts:131-153: the single layout becomes Base (breakpoint 768) and
-		// a fresh Mobile layout is added.
+		// seed.ts:131-153: the single layout becomes Base (breakpoint 768), a
+		// fresh Mobile layout is added and receives the projected positions.
 		if err := s.db.UpdateLayoutRoleAndBreakpoint(ctx, layouts[0].ID, "base", 768); err != nil {
 			return internalError(err)
 		}
-		if err := s.db.InsertLayout(ctx, db.Layout{
+		mobile := db.Layout{
 			ID: createID(), Name: "Mobile", BoardID: boardID, ColumnCount: 3, Breakpoint: 0, Role: "mobile",
-		}); err != nil {
+		}
+		if err := s.db.InsertLayout(ctx, mobile); err != nil {
 			return internalError(err)
 		}
-		return nil
+		base := layouts[0]
+		base.Role, base.Breakpoint = "base", 768
+		return s.insertMissingProjectedPositions(ctx, boardID, base, mobile)
 	}
 
 	// More than two layouts: normalize roles and breakpoints
-	// (seed.ts:155-172) and persist the rows whose values changed.
+	// (seed.ts:155-172), persist the rows whose values changed and project
+	// Base onto Mobile (seed.ts:173-179).
 	normalized := normalizeBoardLayoutRoles(layouts)
 	for _, layout := range normalized {
 		if layout.Breakpoint == layout.storedBreakpoint && layout.Role == layout.storedRole {
@@ -79,7 +83,170 @@ func (s *service) repairProtectedLayouts(ctx context.Context, boardID string, la
 			return internalError(err)
 		}
 	}
+	var mobile, base db.Layout
+	for _, layout := range normalized {
+		if layout.Role == "mobile" {
+			mobile = layout.Layout
+		}
+		if layout.Role == "base" {
+			base = layout.Layout
+		}
+	}
+	return s.insertMissingProjectedPositions(ctx, boardID, base, mobile)
+}
+
+// insertMissingProjectedPositions ports insertMissingProjectedPositionsAsync
+// (packages/db/migrations/seed.ts:209-303): projects every canvas root of the
+// source layout onto the target layout and inserts the placements that do not
+// exist there yet. Unlike getUpdatedBoardLayout this runs on the raw rows (no
+// lane remapping, no parseItem filtering) and leaves resize sources alone.
+func (s *service) insertMissingProjectedPositions(ctx context.Context, boardID string, sourceLayout, targetLayout db.Layout) *trpc.Error {
+	itemRows, err := s.db.ListItemsByBoard(ctx, boardID)
+	if err != nil {
+		return internalError(err)
+	}
+	itemLayoutRows, err := s.db.ListItemLayoutsByBoard(ctx, boardID)
+	if err != nil {
+		return internalError(err)
+	}
+	sectionRows, err := s.db.ListSectionsByBoard(ctx, boardID)
+	if err != nil {
+		return internalError(err)
+	}
+	sectionLayoutRows, err := s.db.ListSectionLayoutsByBoard(ctx, boardID)
+	if err != nil {
+		return internalError(err)
+	}
+
+	// The elements of the source layout (seed.ts:215-249): the first
+	// placement per item, then containers with a parent.
+	elements := []gridItem{}
+	for _, item := range itemRows {
+		for _, l := range itemLayoutRows {
+			if l.ItemID == item.ID && l.LayoutID == sourceLayout.ID {
+				elements = append(elements, gridItem{
+					ID: item.ID, Type: "item",
+					Width: l.Width, Height: l.Height,
+					XOffset: l.XOffset, YOffset: l.YOffset,
+					SectionID: l.SectionID,
+				})
+				break
+			}
+		}
+	}
+	for _, sec := range sectionRows {
+		if sec.Kind != "container" {
+			continue
+		}
+		for _, sl := range sectionLayoutRows {
+			if sl.SectionID == sec.ID && sl.LayoutID == sourceLayout.ID && sl.ParentSectionID != "" {
+				elements = append(elements, gridItem{
+					ID: sec.ID, Type: "section",
+					Width: sl.Width, Height: sl.Height,
+					XOffset: sl.XOffset, YOffset: sl.YOffset,
+					SectionID: sl.ParentSectionID,
+				})
+				break
+			}
+		}
+	}
+
+	// One projection per canvas root, using the raw column counts
+	// (seed.ts:251-261).
+	projected := []gridItem{}
+	for _, sec := range sectionRows {
+		if sec.Kind != "empty" {
+			continue
+		}
+		result, err := generateResponsiveGridFor(elements, targetLayout.ColumnCount, sourceLayout.ColumnCount, sec.ID)
+		if err != nil {
+			return internalError(err)
+		}
+		projected = append(projected, result.Items...)
+	}
+
+	// Only missing placements are inserted (seed.ts:263-302).
+	itemHasTargetPlacement := map[string]bool{}
+	for _, l := range itemLayoutRows {
+		if l.LayoutID == targetLayout.ID {
+			itemHasTargetPlacement[l.ItemID] = true
+		}
+	}
+	sectionHasTargetPlacement := map[string]bool{}
+	for _, sl := range sectionLayoutRows {
+		if sl.LayoutID == targetLayout.ID {
+			sectionHasTargetPlacement[sl.SectionID] = true
+		}
+	}
+	for _, element := range projected {
+		switch element.Type {
+		case "item":
+			if itemHasTargetPlacement[element.ID] {
+				continue
+			}
+			if err := s.db.InsertItemLayout(ctx, db.ItemLayout{
+				ItemID: element.ID, LayoutID: targetLayout.ID, SectionID: element.SectionID,
+				XOffset: element.XOffset, YOffset: element.YOffset,
+				Width: element.Width, Height: element.Height,
+			}); err != nil {
+				return internalError(err)
+			}
+		case "section":
+			if sectionHasTargetPlacement[element.ID] {
+				continue
+			}
+			if err := s.db.InsertSectionLayout(ctx, db.SectionLayout{
+				SectionID: element.ID, LayoutID: targetLayout.ID, ParentSectionID: element.SectionID,
+				XOffset: element.XOffset, YOffset: element.YOffset,
+				Width: element.Width, Height: element.Height,
+			}); err != nil {
+				return internalError(err)
+			}
+		}
+	}
 	return nil
+}
+
+// loadBoardForProjection assembles the boardForLayoutProjection input of
+// getFullBoardWithWhereAsync (board.ts:2941-3060), including the lazy repair
+// of protected layouts every full-board read performs
+// (board.ts:3001-3011) and the parseSection/parseItem preprocessing the full
+// board applies to the rows.
+func (s *service) loadBoardForProjection(ctx context.Context, boardID string) (*boardForLayoutProjection, *trpc.Error) {
+	layoutRows, err := s.db.ListLayoutsByBoard(ctx, boardID)
+	if err != nil {
+		return nil, internalError(err)
+	}
+	if boardLayoutsNeedRepair(layoutRows) {
+		if terr := s.repairProtectedLayouts(ctx, boardID, layoutRows); terr != nil {
+			return nil, terr
+		}
+		if layoutRows, err = s.db.ListLayoutsByBoard(ctx, boardID); err != nil {
+			return nil, internalError(err)
+		}
+	}
+	db.SortLayoutsByBreakpoint(layoutRows)
+
+	sectionRows, err := s.db.ListSectionsByBoard(ctx, boardID)
+	if err != nil {
+		return nil, internalError(err)
+	}
+	itemRows, err := s.db.ListItemsByBoard(ctx, boardID)
+	if err != nil {
+		return nil, internalError(err)
+	}
+	if terr := applyParsedBoardRows(sectionRows, itemRows); terr != nil {
+		return nil, terr
+	}
+	sectionLayoutRows, err := s.db.ListSectionLayoutsByBoard(ctx, boardID)
+	if err != nil {
+		return nil, internalError(err)
+	}
+	itemLayoutRows, err := s.db.ListItemLayoutsByBoard(ctx, boardID)
+	if err != nil {
+		return nil, internalError(err)
+	}
+	return newBoardForLayoutProjection(boardID, layoutRows, sectionRows, sectionLayoutRows, itemRows, itemLayoutRows), nil
 }
 
 // normalizedLayout is a db.Layout plus the values persisted before

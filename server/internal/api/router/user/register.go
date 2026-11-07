@@ -57,57 +57,63 @@ type service struct {
 func Register(r *trpc.Router, database *db.DB, opts Options) {
 	s := &service{db: database, opts: &opts}
 
-	// user.initUser (user.ts:70-129): onboardingProcedure "user" step.
-	r.Register("user.initUser", s.initUser)
-	// user.register (user.ts:130-193): publicProcedure, invite-based.
-	r.Register("user.register", s.register)
-	// user.create (user.ts:194-224): admin.
-	r.Register("user.create", s.create)
-	// user.setProfileImage (user.ts:225-279): protected, self-or-admin.
-	r.Register("user.setProfileImage", s.setProfileImage)
-	// user.getAll (user.ts:280-316): admin.
+	// user.initUser (user.ts:70-129): onboardingProcedure "user" step
+	// (mutation).
+	r.Register("user.initUser", admin.Writable(s.initUser))
+	// user.register (user.ts:130-193): publicProcedure, invite-based
+	// (mutation).
+	r.Register("user.register", admin.Writable(s.register))
+	// user.create (user.ts:194-224): admin (mutation).
+	r.Register("user.create", admin.Writable(s.create))
+	// user.setProfileImage (user.ts:225-279): protected, self-or-admin
+	// (mutation).
+	r.Register("user.setProfileImage", admin.Writable(s.setProfileImage))
+	// user.getAll (user.ts:280-316): admin (query).
 	r.Register("user.getAll", s.getAll)
-	// user.selectable (user.ts:318-351): protected.
+	// user.selectable (user.ts:318-351): protected (query).
 	r.Register("user.selectable", s.selectable)
-	// user.search (user.ts:352-398): admin.
+	// user.search (user.ts:352-398): admin (query).
 	r.Register("user.search", s.search)
-	// user.getPreferences (user.ts:399-418): protected.
+	// user.getPreferences (user.ts:399-418): protected (query).
 	r.Register("user.getPreferences", s.getPreferences)
-	// user.getById (user.ts:419-497): protected, self-or-admin.
+	// user.getById (user.ts:419-497): protected, self-or-admin (query).
 	r.Register("user.getById", s.getById)
-	// user.editProfile (user.ts:498-558): protected, self-or-admin.
-	r.Register("user.editProfile", s.editProfile)
-	// user.delete (user.ts:559-591): protected, self-or-admin.
-	r.Register("user.delete", s.delete)
-	// user.changePassword (user.ts:592-673): protected, self-or-admin.
-	r.Register("user.changePassword", s.changePassword)
-	// user.updatePreferences (user.ts:674-704): protected.
-	r.Register("user.updatePreferences", s.updatePreferences)
-	// user.changeHomeBoards (user.ts:705-724).
-	r.Register("user.changeHomeBoards", s.changeHomeBoards)
-	// user.changeDefaultSearchEngine (user.ts:725-749, deprecated).
-	r.Register("user.changeDefaultSearchEngine", s.changeDefaultSearchEngine)
-	// user.changeSearchPreferences (user.ts:750-770).
-	r.Register("user.changeSearchPreferences", s.changeSearchPreferences)
-	// user.changeColorScheme (user.ts:771-786).
-	r.Register("user.changeColorScheme", s.changeColorScheme)
-	// user.changeByteUnitSystem (user.ts:787-792).
-	r.Register("user.changeByteUnitSystem", s.changeByteUnitSystem)
-	// user.changeEnableRightClickOnWidgets (user.ts:793-809).
-	r.Register("user.changeEnableRightClickOnWidgets", s.changeEnableRightClickOnWidgets)
-	// user.changePingIconsEnabled (user.ts:810-814).
-	r.Register("user.changePingIconsEnabled", s.changePingIconsEnabled)
-	// user.changeHeaderPreferences (user.ts:815-831).
-	r.Register("user.changeHeaderPreferences", s.changeHeaderPreferences)
-	// user.changeDdgBangs (user.ts:832-849, deprecated).
-	r.Register("user.changeDdgBangs", s.changeDdgBangs)
-	// user.changeFirstDayOfWeek (user.ts:850-866).
-	r.Register("user.changeFirstDayOfWeek", s.changeFirstDayOfWeek)
-	// user.completeTour (user.ts:867-876).
-	r.Register("user.completeTour", s.completeTour)
-	// user.resetTours (user.ts:877-885).
-	r.Register("user.resetTours", s.resetTours)
-	// user.getTourStatus (user.ts:886-906).
+	// user.editProfile (user.ts:498-558): protected, self-or-admin
+	// (mutation).
+	r.Register("user.editProfile", admin.Writable(s.editProfile))
+	// user.delete (user.ts:559-591): protected, self-or-admin (mutation).
+	r.Register("user.delete", admin.Writable(s.delete))
+	// user.changePassword (user.ts:592-673): protected, self-or-admin
+	// (mutation).
+	r.Register("user.changePassword", admin.Writable(s.changePassword))
+	// user.updatePreferences (user.ts:674-704): protected (mutation).
+	r.Register("user.updatePreferences", admin.Writable(s.updatePreferences))
+	// user.changeHomeBoards (user.ts:705-724) (mutation).
+	r.Register("user.changeHomeBoards", admin.Writable(s.changeHomeBoards))
+	// user.changeDefaultSearchEngine (user.ts:725-749, deprecated)
+	// (mutation).
+	r.Register("user.changeDefaultSearchEngine", admin.Writable(s.changeDefaultSearchEngine))
+	// user.changeSearchPreferences (user.ts:750-770) (mutation).
+	r.Register("user.changeSearchPreferences", admin.Writable(s.changeSearchPreferences))
+	// user.changeColorScheme (user.ts:771-786) (mutation).
+	r.Register("user.changeColorScheme", admin.Writable(s.changeColorScheme))
+	// user.changeByteUnitSystem (user.ts:787-792) (mutation).
+	r.Register("user.changeByteUnitSystem", admin.Writable(s.changeByteUnitSystem))
+	// user.changeEnableRightClickOnWidgets (user.ts:793-809) (mutation).
+	r.Register("user.changeEnableRightClickOnWidgets", admin.Writable(s.changeEnableRightClickOnWidgets))
+	// user.changePingIconsEnabled (user.ts:810-814) (mutation).
+	r.Register("user.changePingIconsEnabled", admin.Writable(s.changePingIconsEnabled))
+	// user.changeHeaderPreferences (user.ts:815-831) (mutation).
+	r.Register("user.changeHeaderPreferences", admin.Writable(s.changeHeaderPreferences))
+	// user.changeDdgBangs (user.ts:832-849, deprecated) (mutation).
+	r.Register("user.changeDdgBangs", admin.Writable(s.changeDdgBangs))
+	// user.changeFirstDayOfWeek (user.ts:850-866) (mutation).
+	r.Register("user.changeFirstDayOfWeek", admin.Writable(s.changeFirstDayOfWeek))
+	// user.completeTour (user.ts:867-876) (mutation).
+	r.Register("user.completeTour", admin.Writable(s.completeTour))
+	// user.resetTours (user.ts:877-885) (mutation).
+	r.Register("user.resetTours", admin.Writable(s.resetTours))
+	// user.getTourStatus (user.ts:886-906) (query).
 	r.Register("user.getTourStatus", s.getTourStatus)
 }
 

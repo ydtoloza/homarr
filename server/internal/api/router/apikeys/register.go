@@ -29,16 +29,19 @@ type service struct {
 func Register(r *trpc.Router, database *db.DB, _ Options) {
 	s := &service{db: database}
 
-	// apiKeys.getOwnOAuth (apiKeys.ts:22-27): the caller's OAuth-issued keys.
+	// apiKeys.getOwnOAuth (apiKeys.ts:22-27): the caller's OAuth-issued keys
+	// (query).
 	r.Register("apiKeys.getOwnOAuth", s.getOwnOAuth)
-	// apiKeys.revokeOwnOAuth (apiKeys.ts:28-41).
-	r.Register("apiKeys.revokeOwnOAuth", s.revokeOwnOAuth)
-	// apiKeys.getAll (apiKeys.ts:42-61): every key with its user (admin).
+	// apiKeys.revokeOwnOAuth (apiKeys.ts:28-41) (mutation).
+	r.Register("apiKeys.revokeOwnOAuth", admin.Writable(s.revokeOwnOAuth))
+	// apiKeys.getAll (apiKeys.ts:42-61): every key with its user (admin)
+	// (query).
 	r.Register("apiKeys.getAll", s.getAll)
-	// apiKeys.create (apiKeys.ts:62-84): mint one key, plaintext once (admin).
-	r.Register("apiKeys.create", s.create)
-	// apiKeys.delete (apiKeys.ts:85-96): delete by id (admin).
-	r.Register("apiKeys.delete", s.delete)
+	// apiKeys.create (apiKeys.ts:62-84): mint one key, plaintext once (admin)
+	// (mutation).
+	r.Register("apiKeys.create", admin.Writable(s.create))
+	// apiKeys.delete (apiKeys.ts:85-96): delete by id (admin) (mutation).
+	r.Register("apiKeys.delete", admin.Writable(s.delete))
 }
 
 // getOwnOAuth is apiKeys.getOwnOAuth: protectedProcedure listing the

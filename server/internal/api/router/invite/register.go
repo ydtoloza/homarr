@@ -33,12 +33,12 @@ type service struct {
 // at startup (Register panics on duplicate paths).
 func Register(r *trpc.Router, database *db.DB, _ Options) {
 	s := &service{db: database}
-	// invite.getAll (invite.ts:14-57).
+	// invite.getAll (invite.ts:14-57) (query).
 	r.Register("invite.getAll", s.getAll)
-	// invite.createInvite (invite.ts:58-99).
-	r.Register("invite.createInvite", s.createInvite)
-	// invite.deleteInvite (invite.ts:100-138).
-	r.Register("invite.deleteInvite", s.deleteInvite)
+	// invite.createInvite (invite.ts:58-99) (mutation).
+	r.Register("invite.createInvite", admin.Writable(s.createInvite))
+	// invite.deleteInvite (invite.ts:100-138) (mutation).
+	r.Register("invite.deleteInvite", admin.Writable(s.deleteInvite))
 }
 
 // getAll is invite.getAll: permissionRequiredProcedure "admin", invites

@@ -31,6 +31,10 @@ type Options struct {
 	// frontend connects to; upstream nginx proxies it there). Nil skips the
 	// mount.
 	WebSockets http.Handler
+	// OnboardingClaim is the REST handler mounted at /api/onboarding/claim
+	// (the onboarding wizard token issuer). The integrator wraps it with the
+	// auth middleware. Nil skips the mount.
+	OnboardingClaim http.Handler
 	// Version is reported by the health endpoints.
 	Version string
 	// Started is the process start time, reported as uptime.
@@ -61,6 +65,9 @@ func New(opts Options) http.Handler {
 	}
 	if opts.WebSockets != nil {
 		r.Handle("/websockets", opts.WebSockets)
+	}
+	if opts.OnboardingClaim != nil {
+		r.Handle("/api/onboarding/claim", opts.OnboardingClaim)
 	}
 
 	// M4 mount point (planned):
