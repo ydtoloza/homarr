@@ -3,9 +3,12 @@
 package httpserver
 
 import (
+	"bufio"
 	"encoding/json"
+	"errors"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -24,6 +27,10 @@ type Options struct {
 	// Auth is the Auth.js-compatible REST surface mounted at /api/auth/*
 	// (csrf, callback/credentials, session, signout). Nil skips the mount.
 	Auth http.Handler
+	// WebSockets is the tRPC WS hub mounted at /websockets (the path the
+	// frontend connects to; upstream nginx proxies it there). Nil skips the
+	// mount.
+	WebSockets http.Handler
 	// Version is reported by the health endpoints.
 	Version string
 	// Started is the process start time, reported as uptime.
@@ -52,9 +59,12 @@ func New(opts Options) http.Handler {
 	if opts.Auth != nil {
 		r.Handle("/api/auth/*", opts.Auth)
 	}
+	if opts.WebSockets != nil {
+		r.Handle("/websockets", opts.WebSockets)
+	}
 
-	// M3 mount point (planned):
-	//   r.Handle("/api/ws", ws.NewHub(...))
+	// M4 mount point (planned):
+	//   SSE subscriptions ride /api/trpc (httpSubscriptionLink) — no extra mount.
 
 	if opts.Static != nil {
 		r.Handle("/*", spaHandler(opts.Static))
@@ -122,6 +132,24 @@ type statusWriter struct {
 func (w *statusWriter) WriteHeader(code int) {
 	w.status = code
 	w.ResponseWriter.WriteHeader(code)
+}
+
+// Hijack forwards the WebSocket upgrade: coder/websocket requires the raw
+// ResponseWriter to implement http.Hijacker (the type assertion is direct,
+// Unwrap is not consulted).
+func (w *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hj, ok := w.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, errors.New("httpserver: ResponseWriter does not implement http.Hijacker")
+	}
+	return hj.Hijack()
+}
+
+// Flush forwards stream flushes (tRPC SSE/jsonl responses).
+func (w *statusWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 func requestLogger(next http.Handler) http.Handler {

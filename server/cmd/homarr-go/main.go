@@ -24,6 +24,7 @@ import (
 	"time"
 
 	homarr "github.com/ydtoloza/homarr/server"
+	"github.com/ydtoloza/homarr/server/internal/api/ctxauth"
 	"github.com/ydtoloza/homarr/server/internal/api/router/apikeys"
 	"github.com/ydtoloza/homarr/server/internal/api/router/bangs"
 	"github.com/ydtoloza/homarr/server/internal/api/router/board"
@@ -36,9 +37,12 @@ import (
 	"github.com/ydtoloza/homarr/server/internal/api/router/user"
 	"github.com/ydtoloza/homarr/server/internal/api/trpc"
 	"github.com/ydtoloza/homarr/server/internal/auth"
+	"github.com/ydtoloza/homarr/server/internal/bus"
 	"github.com/ydtoloza/homarr/server/internal/config"
 	"github.com/ydtoloza/homarr/server/internal/db"
 	"github.com/ydtoloza/homarr/server/internal/httpserver"
+	"github.com/ydtoloza/homarr/server/internal/jobs"
+	"github.com/ydtoloza/homarr/server/internal/ws"
 )
 
 // version is injected at build time: -ldflags "-X main.version=...".
@@ -82,6 +86,27 @@ func run() error {
 	slog.Info("database ready", "path", cfg.DBPath(), "migrations", mustMigrationCount(database))
 
 	authSvc := auth.New(database, auth.Options{Secret: secretForCSRF()})
+
+	// In-process event bus replaces upstream's Redis pub/sub; the scheduler
+	// produces domain events (ping results, job status) and the WebSocket hub
+	// fans them out to browsers.
+	eventBus := bus.New()
+	scheduler := jobs.New(database, eventBus)
+	scheduler.Register(jobs.PingJob(database, eventBus))
+	hub := ws.New(eventBus, websocketSessions(authSvc, database), ws.Options{
+		KeepAlive: &ws.KeepAlive{}, // upstream defaults: 30s ping / 5s pong timeout
+	})
+	registerSubscriptions(hub)
+	if err := scheduler.Start(ctx); err != nil {
+		return err
+	}
+	// LIFO on shutdown: the scheduler stops producing first, then the hub
+	// broadcasts the reconnect notification and closes (upstream SIGTERM
+	// behavior, apps/websocket/src/main.ts:110-118).
+	defer hub.Close()
+	defer scheduler.Stop()
+	slog.Info("cron scheduler and websocket hub ready")
+
 	api := trpc.New()
 	registerRouters(api, database)
 	slog.Info("tRPC routers registered")
@@ -89,10 +114,11 @@ func run() error {
 	srv := &http.Server{
 		Addr: ":" + cfg.Port,
 		Handler: httpserver.New(httpserver.Options{
-			Static:  homarr.Sub(),
-			TRPC:    authSvc.Middleware()(withRequestMeta(api.Handler())),
-			Auth:    authSvc.Handler(),
-			Version: version,
+			Static:     homarr.Sub(),
+			TRPC:       authSvc.Middleware()(withRequestMeta(api.Handler())),
+			Auth:       authSvc.Handler(),
+			WebSockets: hub.Handler(),
+			Version:    version,
 		}),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
@@ -117,6 +143,42 @@ func run() error {
 		}
 	}
 	return nil
+}
+
+// registerSubscriptions wires the tRPC subscription paths the WebSocket hub
+// serves to their event sources. Only paths with a live producer are
+// registered; log.subscribe and docker.subscribeLogs land in M4 with their
+// producers (see WEBSOCKET.md).
+func registerSubscriptions(hub *ws.Hub) {
+	// cronJobs.subscribeToStatusUpdates: admin-only, mirrors
+	// packages/api/src/router/cron-jobs.ts:62-82.
+	hub.Register("cronJobs.subscribeToStatusUpdates", ws.SubscriptionHandlerFunc(
+		func(ctx context.Context, req *ws.Request) (*ws.Subscription, error) {
+			if req.Session == nil {
+				return nil, trpc.NewError(trpc.CodeUnauthorized, "UNAUTHORIZED")
+			}
+			if !req.Session.IsAdministrator {
+				return nil, trpc.NewError(trpc.CodeForbidden, "Permission denied")
+			}
+			return &ws.Subscription{Pattern: "events.cronjob.*"}, nil
+		}))
+}
+
+// websocketSessions adapts auth.Auth to the ws.SessionValidator contract.
+func websocketSessions(authSvc *auth.Auth, database *db.DB) ws.SessionValidator {
+	return ws.SessionValidatorFunc(func(ctx context.Context, token string) (*ctxauth.Session, error) {
+		s, err := authSvc.ValidateSession(ctx, token)
+		if err != nil {
+			return nil, err
+		}
+		// "admin" is the admin group permission key
+		// (packages/definitions/src/group.ts).
+		isAdmin, err := database.UserHasPermission(ctx, s.UserID, "admin")
+		if err != nil {
+			return nil, err
+		}
+		return &ctxauth.Session{UserID: s.UserID, IsAdministrator: isAdmin}, nil
+	})
 }
 
 // registerRouters mounts every ported tRPC router under its exact upstream
