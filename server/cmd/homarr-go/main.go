@@ -28,6 +28,7 @@ import (
 	"github.com/ydtoloza/homarr/server/internal/api/router/apikeys"
 	"github.com/ydtoloza/homarr/server/internal/api/router/bangs"
 	"github.com/ydtoloza/homarr/server/internal/api/router/board"
+	dockerrouter "github.com/ydtoloza/homarr/server/internal/api/router/docker"
 	"github.com/ydtoloza/homarr/server/internal/api/router/group"
 	"github.com/ydtoloza/homarr/server/internal/api/router/info"
 	"github.com/ydtoloza/homarr/server/internal/api/router/invite"
@@ -35,12 +36,14 @@ import (
 	"github.com/ydtoloza/homarr/server/internal/api/router/searchengine"
 	"github.com/ydtoloza/homarr/server/internal/api/router/serversettings"
 	"github.com/ydtoloza/homarr/server/internal/api/router/user"
+	"github.com/ydtoloza/homarr/server/internal/api/router/widgets"
 	"github.com/ydtoloza/homarr/server/internal/api/trpc"
 	"github.com/ydtoloza/homarr/server/internal/auth"
 	"github.com/ydtoloza/homarr/server/internal/bus"
 	"github.com/ydtoloza/homarr/server/internal/config"
 	"github.com/ydtoloza/homarr/server/internal/db"
 	"github.com/ydtoloza/homarr/server/internal/httpserver"
+	dockerint "github.com/ydtoloza/homarr/server/internal/integrations/docker"
 	"github.com/ydtoloza/homarr/server/internal/jobs"
 	"github.com/ydtoloza/homarr/server/internal/ws"
 )
@@ -109,6 +112,20 @@ func run() error {
 
 	api := trpc.New()
 	registerRouters(api, database)
+
+	// Docker domain: endpoints come from the environment (DOCKER_ENDPOINTS /
+	// DOCKER_SOCKET_PATHS / DOCKER_HOST, see DOCKER.md), not the database.
+	// The service also exposes the docker.subscribeLogs WebSocket bridge.
+	var dockerSvc *dockerrouter.Service
+	if dockerRegistry, err := dockerint.RegistryFromEnv(os.Getenv); err != nil {
+		slog.Warn("docker endpoint registry unavailable; docker routes disabled", "err", err)
+	} else {
+		dockerSvc = dockerrouter.Register(api, database, dockerRegistry, dockerrouter.Options{})
+		for path, handler := range dockerSvc.SubscriptionHandlers() {
+			hub.Register(path, handler)
+		}
+		slog.Info("docker routes enabled", "endpoints", len(dockerRegistry.Endpoints()))
+	}
 	slog.Info("tRPC routers registered")
 
 	srv := &http.Server{
@@ -202,6 +219,9 @@ func registerRouters(api *trpc.Router, database *db.DB) {
 	bangs.Register(api, database, bangs.Options{}) // deferred upstream (duckduckgo proxy), M3
 	apikeys.Register(api, database, apikeys.Options{})
 	info.Register(api, database, info.Options{Version: version})
+	widgets.Register(api, widgets.Options{
+		ResolveIntegrations: resolveIntegrations(database),
+	})
 }
 
 // Request-scoped context values consumed by router hooks, mirroring the
@@ -237,6 +257,14 @@ func deviceTypeFromUserAgent(ua string) string {
 func deviceTypeFromContext(ctx context.Context) string {
 	v, _ := ctx.Value(deviceKeyType{}).(string)
 	return v
+}
+
+// resolveIntegrations is the DB-backed integration middleware seam
+// (WIDGETS.md §2). Until the integration CRUD routers land (M4), no
+// integrations resolve and the widget queries report their per-integration
+// public errors exactly like an empty upstream database would.
+func resolveIntegrations(database *db.DB) widgets.ResolveIntegrations {
+	return nil
 }
 
 func onboardingClaimFromContext(ctx context.Context) string {
